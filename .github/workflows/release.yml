@@ -4,6 +4,12 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      use_self_hosted:
+        description: 使用组织自托管 runner 构建 macOS ARM64 和 Windows x64
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -17,8 +23,7 @@ jobs:
         include:
           - target: macos-arm64
             runner: macos-14
-            # runner_labels: self-hosted label set used when USE_SELF_HOSTED is
-            # unset/true; 'null' falls back to the GitHub-hosted runner above.
+            # 自托管 runner 标签；仅在手动构建勾选 use_self_hosted 时使用。
             runner_labels: '["self-hosted","macOS","ARM64"]'
           - target: macos-x64
             runner: macos-15-intel
@@ -29,9 +34,9 @@ jobs:
           - target: linux-x64
             runner: ubuntu-22.04
             runner_labels: 'null'
-    # USE_SELF_HOSTED (Actions variable): unset/true routes macos-arm64 and windows-x64
-    # builds to org self-hosted runners; 'false' keeps everything GitHub-hosted.
-    runs-on: ${{ vars.USE_SELF_HOSTED != 'false' && fromJSON(matrix.runner_labels) || matrix.runner }}
+    # 手动构建勾选 use_self_hosted 时，macOS ARM64 和 Windows x64 使用组织自托管
+    # runner；未勾选、标签发布或其他平台使用 GitHub 托管 runner。
+    runs-on: ${{ inputs.use_self_hosted && fromJSON(matrix.runner_labels) || matrix.runner }}
     env:
       PRISM_PLATFORM: ${{ matrix.target }}
     steps:
