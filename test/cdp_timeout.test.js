@@ -148,10 +148,11 @@ test("interactive surface keeps the raw DOM target after desktop-only actions ar
   assert.equal(surface.description, "Full access can modify files outside the workspace.");
   assert.deepEqual(surface.actions.map((action) => action.label), ["Cancel", "Confirm"]);
 
-  await controller.applyInteractiveSurface(surface.surface_id, surface.actions[0].action_id);
+  await controller.applyInteractiveSurface(surface.surface_id, surface.actions[1].action_id);
 
-  assert.match(clickScript, /actions\[1\]/);
-  assert.doesNotMatch(clickScript, /actions\[0\]/);
+  assert.equal(reads, 2, "surface and action identity are re-read immediately before the click");
+  assert.match(clickScript, /actions\[2\]/);
+  assert.doesNotMatch(clickScript, /actions\[1\]/);
   assert.match(clickScript, /PointerEvent\('pointerdown'/);
   assert.match(clickScript, /MouseEvent\('click'/);
 });

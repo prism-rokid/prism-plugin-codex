@@ -299,7 +299,7 @@ test("project creation uses the unique project-bound new-thread owner", async ()
   assert.doesNotMatch(clicked, /New chat|新对话|keyPress/);
 });
 
-test("global draft creation uses the unique Fiber owner without a shortcut or label", async () => {
+test("global draft creation selects the sidebar action and excludes its quick-chat tooltip action", async () => {
   const controller = Object.create(CodexDesktopController.prototype);
   let clicked = "";
   controller.ensureReady = async () => {};
@@ -314,8 +314,76 @@ test("global draft creation uses the unique Fiber owner without a shortcut or la
   assert.match(clicked, /showQuickChatButton/);
   assert.match(clicked, /quickChatEnabled/);
   assert.match(clicked, /hooksHaveStartNewConversation/);
+  assert.match(clicked, /!element\.closest\('\[aria-describedby\]'\)/);
   assert.match(clicked, /candidates\.length === 1/);
   assert.doesNotMatch(clicked, /keyPress|New chat|新对话|Ctrl\\\+N|⌘N/);
+});
+
+test("Codex 154 flat model radio rows become one opaque model group", () => {
+  const rows = [
+    { optionId: "flat:astra", label: "GPT-6 Astra", checked: false, disabled: false },
+    { optionId: "flat:sol", label: "GPT-6 Sol", checked: true, disabled: false },
+    { optionId: "flat:luna", label: "GPT-6 Luna", checked: false, disabled: false },
+  ];
+  const group = cdpTest.flatIntelligenceModelGroup(rows);
+  assert.equal(group.control_id, cdpTest.FLAT_INTELLIGENCE_MODEL_CONTROL_ID);
+  assert.deepEqual(group.rows, rows);
+  assert.equal(cdpTest.flatIntelligenceModelGroup(rows.map((row) => ({ ...row, checked: false }))), null);
+  assert.equal(cdpTest.flatIntelligenceModelGroup(rows.map((row) => ({ ...row, checked: true }))), null);
+});
+
+test("flat model session describe reads direct menuitemradio rows and closes the menu", async () => {
+  const fixtureRows = [
+    { optionId: "flat:astra", label: "GPT-6 Astra", checked: false, disabled: false },
+    { optionId: "flat:sol", label: "GPT-6 Sol", checked: true, disabled: false },
+  ];
+  const controller = Object.create(CodexDesktopController.prototype);
+  let opened = 0;
+  let closed = 0;
+  controller.openIntelligenceMenu = async () => { opened += 1; };
+  controller.intelligenceRootControls = async () => [];
+  controller.evaluate = async (source) => {
+    assert.match(source, /\[role="menuitemradio"\]/);
+    assert.match(source, /aria-labelledby/);
+    return fixtureRows;
+  };
+  controller.closeVisibleMenus = async () => { closed += 1; };
+
+  const groups = await controller.listIntelligenceMenuGroups();
+  assert.equal(opened, 1);
+  assert.equal(closed, 1);
+  assert.deepEqual(groups, [{
+    control_id: cdpTest.FLAT_INTELLIGENCE_MODEL_CONTROL_ID,
+    label: "Model",
+    rows: fixtureRows,
+  }]);
+});
+
+test("flat model apply revalidates the menu and clicks only the requested opaque row", async () => {
+  const fixtureRows = [
+    { optionId: "flat:astra", label: "GPT-6 Astra", checked: false, disabled: false },
+    { optionId: "flat:sol", label: "GPT-6 Sol", checked: true, disabled: false },
+  ];
+  const controller = Object.create(CodexDesktopController.prototype);
+  let clicked = "";
+  let closed = 0;
+  controller.openIntelligenceMenu = async () => {};
+  controller.evaluate = async (source) => {
+    assert.match(source, /\[role="menuitemradio"\]/);
+    return fixtureRows;
+  };
+  controller.clickDomElement = async (source) => { clicked = source; };
+  controller.closeVisibleMenus = async () => { closed += 1; };
+  controller.readInteractiveSurface = async () => null;
+
+  await controller.applyInteractiveComposerMenuSession(
+    cdpTest.FLAT_INTELLIGENCE_MODEL_CONTROL_ID,
+    "flat:astra",
+    fixtureRows,
+  );
+  assert.match(clicked, /flat:astra/);
+  assert.match(clicked, /aria-labelledby/);
+  assert.equal(closed, 1);
 });
 
 test("discovery does not use the conversation directory as an availability probe", () => {

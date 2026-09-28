@@ -54,7 +54,7 @@ Dashboard 插件页手动指定应用路径；原始 `PRISM_CODEX_APP_PATH` 仅�
 Control-path notes:
 
 - Prism 这条线已经收口成 CDP-only，不再混用 app-server、深链切线程、剪贴板粘贴发送
-  - 例外：账号额度投影（`agent_usage`）是只读诊断通道，投影 5 小时（300 分钟）和每周（10080 分钟）两个窗口；仍走 App Server 的 `account/rateLimits/read`、`account/usage/read` 与 `account/rateLimits/updated`，不参与任何 thread 控制；可执行体解析桌面 app 内置 `Contents/Resources/codex` 以复用 `~/.codex/auth.json`，PATH/npm CLI `codex` 会因 `-32600 chatgpt authentication required` 失败
+  - 例外：账号额度投影（`agent_usage`）是只读诊断通道，投影 5 小时（300 分钟）和每周（10080 分钟）两个窗口；仍走 App Server 的 `account/rateLimits/read`、`account/usage/read` 与 `account/rateLimits/updated`，不参与任何 thread 控制；可执行体按序解析桌面 app 内置二进制（`Contents/Resources/codex-cli/bin/codex`（2026-09 桌面版新布局）或旧布局 `Contents/Resources/codex`）以复用 `~/.codex/auth.json`，PATH/npm CLI `codex` 会因 `-32600 chatgpt authentication required` 失败
 - 模型 / 推理 / 权限优先走桌面 live 菜单索引点击，减少对中英文文案匹配的依赖
 - manifest 将 Desktop 的模型、推理、权限声明为 `runtime_controls.*=interactive`；组合 intelligence 控件携带 `semantic_kinds: [model, reasoning]`，权限控件携带 `[permission]`。Plugin 不再同时对外发布稳定 `current_*` 控件。
 - manifest 将重命名、置顶、归档、删除声明为 `runtime_operations.*=menu`；这些操作只从当前真实 Header menu-session 暴露，不再与 direct `actions[]` 重复。

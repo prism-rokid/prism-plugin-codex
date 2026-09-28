@@ -46,3 +46,50 @@ test("menu session rows retain native selected state without inferring it from l
 
   assert.deepEqual(rows.map((row) => row.current), [false, true]);
 });
+
+test("permission confirmation picks the single non-dismissive dialog action", () => {
+  const surface = {
+    surface_id: "desktop-surface:test",
+    capability: "permission_confirmation",
+    actions: [
+      { action_id: "a-cancel", label: "取消", available: true },
+      { action_id: "a-confirm", label: "确认", available: true },
+    ],
+  };
+
+  const action = __test.confirmablePermissionAction(surface);
+  assert.equal(action.action_id, "a-confirm");
+});
+
+test("permission confirmation accepts an English dialog", () => {
+  const action = __test.confirmablePermissionAction({
+    surface_id: "desktop-surface:test",
+    actions: [
+      { action_id: "a-cancel", label: "Cancel", available: true },
+      { action_id: "a-confirm", label: "Confirm", available: true },
+    ],
+  });
+
+  assert.equal(action.action_id, "a-confirm");
+});
+
+test("permission confirmation never guesses with ambiguous or missing actions", () => {
+  assert.equal(__test.confirmablePermissionAction(null), null);
+  assert.equal(__test.confirmablePermissionAction({ actions: [] }), null);
+  assert.equal(__test.confirmablePermissionAction({
+    actions: [{ action_id: "a-cancel", label: "取消", available: true }],
+  }), null);
+  assert.equal(__test.confirmablePermissionAction({
+    actions: [
+      { action_id: "a-cancel", label: "取消", available: true },
+      { action_id: "a-disabled", label: "确认", available: false },
+    ],
+  }), null);
+  assert.equal(__test.confirmablePermissionAction({
+    actions: [
+      { action_id: "a-cancel", label: "取消", available: true },
+      { action_id: "a-one", label: "仅此文件夹", available: true },
+      { action_id: "a-two", label: "始终允许", available: true },
+    ],
+  }), null);
+});

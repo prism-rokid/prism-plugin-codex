@@ -1074,6 +1074,61 @@ function intelligenceRootControlsExpression() {
   })()`;
 }
 
+const FLAT_INTELLIGENCE_MODEL_CONTROL_ID = "codex.intelligence.flat-model";
+
+// Codex 154 renders model choices as direct radio rows in the trigger-owned
+// menu, instead of exposing model/reasoning submenu roots with aria-controls.
+function flatIntelligenceMenuRowsExpression() {
+  return `(() => {
+    const trigger = document.querySelector('[data-codex-intelligence-trigger="true"]');
+    if (!trigger) return [];
+    const visible = (el) => {
+      const rect = el && el.getBoundingClientRect();
+      return Boolean(rect && rect.width > 0 && rect.height > 0);
+    };
+    const triggerID = String(trigger.id || '').trim();
+    const controlledMenuID = String(trigger.getAttribute('aria-controls') || '').trim();
+    const menus = [...document.querySelectorAll('[role="menu"]')].filter((menu) =>
+      visible(menu) && ((triggerID && String(menu.getAttribute('aria-labelledby') || '').trim() === triggerID) ||
+        (controlledMenuID && String(menu.id || '').trim() === controlledMenuID))
+    );
+    if (menus.length !== 1) return [];
+    const menu = menus[0];
+    const rows = [...menu.querySelectorAll('[role="menuitemradio"]')]
+      .filter((el) => el.closest('[role="menu"]') === menu && visible(el));
+    return rows.map((el, index) => {
+      const text = String(el.innerText || el.textContent || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+      const accessibleName = String(el.getAttribute('aria-label') || text).replace(/\\s+/g, ' ').trim();
+      if (!accessibleName) return null;
+      const fingerprint = (value) => {
+        let hash = 0xcbf29ce484222325n;
+        for (const char of String(value || '').normalize('NFKC').replace(/\\s+/g, ' ').trim().toLocaleLowerCase()) {
+          hash = BigInt.asUintN(64, (hash ^ BigInt(char.codePointAt(0))) * 0x100000001b3n);
+        }
+        return hash.toString(16).padStart(16, '0');
+      };
+      const checked = el.getAttribute('aria-checked') === 'true' || el.getAttribute('aria-selected') === 'true' ||
+        el.getAttribute('data-state') === 'checked' || el.getAttribute('data-checked') === 'true';
+      return {
+        index,
+        optionId: ${JSON.stringify(FLAT_INTELLIGENCE_MODEL_CONTROL_ID)} + ':' + fingerprint(accessibleName),
+        label: text,
+        checked,
+        disabled: el.getAttribute('aria-disabled') === 'true' || el.hasAttribute('disabled'),
+      };
+    }).filter(Boolean);
+  })()`;
+}
+
+function flatIntelligenceModelGroup(rows) {
+  if (!Array.isArray(rows) || rows.length === 0 || rows.filter((row) => row && row.checked).length !== 1) return null;
+  return {
+    control_id: FLAT_INTELLIGENCE_MODEL_CONTROL_ID,
+    label: "Model",
+    rows,
+  };
+}
+
 function intelligenceSubmenuRowsExpression(controlID) {
   return `(() => {
     const controlID = ${JSON.stringify(String(controlID || ''))};
@@ -2830,6 +2885,10 @@ class CodexDesktopController extends CdpPageClient {
       const candidates = [...document.querySelectorAll('button, [role="button"]')]
         .filter(visible)
         .filter(enabled)
+        // The quick-chat trailing action is wrapped by its own tooltip and
+        // shares the global startNewConversation Fiber owner in Desktop 154.
+        // Keep the main sidebar action and exclude tooltip-trigger actions.
+        .filter((element) => !element.closest('[aria-describedby]'))
         .filter(isGlobalNewThreadButton);
       return candidates.length === 1 ? candidates[0] : null;
     })()`;
@@ -3014,13 +3073,19 @@ class CodexDesktopController extends CdpPageClient {
   async listIntelligenceMenuGroups() {
     await this.openIntelligenceMenu();
     let controls;
+    let flatRows = [];
     try {
       controls = await this.intelligenceRootControls();
+      if (!Array.isArray(controls) || controls.length === 0) {
+        flatRows = await this.evaluate(flatIntelligenceMenuRowsExpression());
+      }
     } finally {
       await this.closeVisibleMenus();
     }
     if (!Array.isArray(controls) || !controls.length) {
-      throw new Error("control_target_stale: intelligence menu has no readable groups");
+      const flatGroup = flatIntelligenceModelGroup(flatRows);
+      if (!flatGroup) throw new Error("control_target_stale: intelligence menu has no readable groups");
+      return [flatGroup];
     }
     const groups = [];
     for (const control of controls) {
@@ -3293,6 +3358,54 @@ class CodexDesktopController extends CdpPageClient {
         if (!surface) await this.closeVisibleMenus();
       }
       return { surface };
+    }
+    if (normalizedControlID === FLAT_INTELLIGENCE_MODEL_CONTROL_ID) {
+      await this.openIntelligenceMenu();
+      try {
+        const rows = await this.evaluate(flatIntelligenceMenuRowsExpression());
+        if (!sameComposerMenuRows(rows, expected)) {
+          throw new Error("control_target_stale: flat intelligence menu structure changed");
+        }
+        const matches = rows.filter((row) => row && row.optionId === String(optionID || "").trim() && !row.disabled);
+        if (matches.length !== 1) {
+          throw new Error("control_target_stale: flat intelligence option is not uniquely present in the current desktop menu");
+        }
+        const target = `(() => {
+          const trigger = document.querySelector('[data-codex-intelligence-trigger="true"]');
+          if (!trigger) return null;
+          const visible = (el) => {
+            const rect = el && el.getBoundingClientRect();
+            return Boolean(rect && rect.width > 0 && rect.height > 0);
+          };
+          const triggerID = String(trigger.id || '').trim();
+          const controlledMenuID = String(trigger.getAttribute('aria-controls') || '').trim();
+          const menus = [...document.querySelectorAll('[role="menu"]')].filter((menu) =>
+            visible(menu) && ((triggerID && String(menu.getAttribute('aria-labelledby') || '').trim() === triggerID) ||
+              (controlledMenuID && String(menu.id || '').trim() === controlledMenuID))
+          );
+          if (menus.length !== 1) return null;
+          const fingerprint = (value) => {
+            let hash = 0xcbf29ce484222325n;
+            for (const char of String(value || '').normalize('NFKC').replace(/\\s+/g, ' ').trim().toLocaleLowerCase()) {
+              hash = BigInt.asUintN(64, (hash ^ BigInt(char.codePointAt(0))) * 0x100000001b3n);
+            }
+            return hash.toString(16).padStart(16, '0');
+          };
+          const matches = [...menus[0].querySelectorAll('[role="menuitemradio"]')]
+            .filter((el) => el.closest('[role="menu"]') === menus[0] && visible(el))
+            .filter((el) => {
+              const name = String(el.getAttribute('aria-label') || el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+              return ${JSON.stringify(FLAT_INTELLIGENCE_MODEL_CONTROL_ID)} + ':' + fingerprint(name) === ${JSON.stringify(String(optionID || "").trim())};
+            })
+            .filter((el) => el.getAttribute('aria-disabled') !== 'true' && !el.hasAttribute('disabled'));
+          return matches.length === 1 ? matches[0] : null;
+        })()`;
+        await this.clickDomElement(target);
+        await sleep(180);
+      } finally {
+        await this.closeVisibleMenus();
+      }
+      return { surface: await this.readInteractiveSurface() };
     }
     await this.openIntelligenceControl(normalizedControlID);
     let surface = null;
@@ -3672,5 +3785,8 @@ module.exports = {
     goalComposerSubmitElementExpression,
     composerEditableElementExpression,
     loopbackListeningPorts,
+    flatIntelligenceMenuRowsExpression,
+    flatIntelligenceModelGroup,
+    FLAT_INTELLIGENCE_MODEL_CONTROL_ID,
   },
 };

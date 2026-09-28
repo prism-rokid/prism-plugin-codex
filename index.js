@@ -245,14 +245,26 @@ function accountUsageSummary(usage) {
 // `-32600 chatgpt authentication required to read rate limits`. The desktop app
 // bundles its own `codex` binary under Contents/Resources (macOS), which reuses
 // the desktop session in ~/.codex/auth.json and authenticates successfully.
+// ChatGPT desktop builds since late Sep 2026 moved the binary to
+// `Resources/codex-cli/bin/codex` (a wrapper around CodexCLI.app); older builds
+// ship a single `Resources/codex` file.
+const BUNDLED_CODEX_CLI_RELATIVE_PATHS = ["codex-cli/bin/codex", "codex"];
+
+function bundledCodexCli(bundle) {
+  for (const relativePath of BUNDLED_CODEX_CLI_RELATIVE_PATHS) {
+    const cli = path.join(bundle, "Contents", "Resources", relativePath);
+    if (fs.existsSync(cli)) return cli;
+  }
+  return null;
+}
+
 function codexAppServerExecutable() {
   const override = String(process.env.PRISM_CODEX_APP_SERVER_EXECUTABLE || "").trim();
   if (override) return override;
   if (process.platform === "darwin") {
-    const bundles = ["/Applications/Codex.app", "/Applications/ChatGPT.app"];
-    for (const bundle of bundles) {
-      const cli = path.join(bundle, "Contents", "Resources", "codex");
-      if (fs.existsSync(cli)) return cli;
+    for (const bundle of ["/Applications/Codex.app", "/Applications/ChatGPT.app"]) {
+      const cli = bundledCodexCli(bundle);
+      if (cli) return cli;
     }
     // Honor a developer-supplied app bundle / main executable override too.
     const appPath = String(process.env.PRISM_CODEX_APP_PATH || "").trim();
@@ -260,8 +272,8 @@ function codexAppServerExecutable() {
     const idx = appPath.indexOf(marker);
     const bundle = idx >= 0 ? appPath.slice(0, idx + marker.length - 1) : (appPath.endsWith(".app") ? appPath : "");
     if (bundle) {
-      const cli = path.join(bundle, "Contents", "Resources", "codex");
-      if (fs.existsSync(cli)) return cli;
+      const cli = bundledCodexCli(bundle);
+      if (cli) return cli;
     }
   }
   // Windows / Linux bundled layout is not confirmed yet; fall back to PATH.
@@ -735,6 +747,40 @@ function rememberControlCreatedSurface(threadID, surface, capability = "") {
   while (controlCreatedSurfaceByThread.size > CONTROL_CREATED_SURFACE_MAX) {
     controlCreatedSurfaceByThread.delete(controlCreatedSurfaceByThread.keys().next().value);
   }
+}
+
+// A permission change can make Codex raise its own confirmation dialog over
+// the Desktop window (full access is the current example). The Panel renders
+// no interactive surface, so a pending dialog would wedge the desktop behind
+// a modal nobody can answer remotely. The user already picked the target
+// option in the Panel, so confirm the dialog on their behalf when exactly one
+// action is not a dismissive choice. An ambiguous dialog keeps the current
+// behavior: publish the surface and let a Desktop user answer it.
+function confirmablePermissionAction(surface = null) {
+  const actions = Array.isArray(surface && surface.actions) ? surface.actions : [];
+  // Treat only explicit consent wording as authorization. Buttons such as
+  // "Learn more" or "Open Settings" must never become the implicit choice.
+  const affirmative = (label) => /^(?:(?:yes[, ]*)?(?:confirm|allow|approve|grant|enable|continue|proceed)(?:\b.*)?|(?:确认|确定|允许|授权|启用|继续)(?:.{0,12})?)$/i
+    .test(String(label || "").replace(/\s+/g, " ").trim());
+  const candidates = actions.filter((action) => action
+    && action.available !== false
+    && affirmative(action.label));
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+async function autoConfirmPermissionSurface(controller, threadID = "", surface = null) {
+  const action = confirmablePermissionAction(surface);
+  if (!action) return false;
+  try {
+    await controller.applyInteractiveSurface(surface.surface_id, action.action_id, "");
+  } catch (error) {
+    console.error(`[codex] permission confirmation dialog auto-apply failed: thread_id=${isThreadID(threadID) ? threadID : "draft"} err=${error && error.message ? error.message : String(error)}`);
+    return false;
+  }
+  // The dialog is consumed; a watcher poll must not republish it.
+  controlCreatedSurfaceByThread.delete(threadID);
+  scheduleDesktopWatchBurst(threadID, "permission_auto_confirmed");
+  return true;
 }
 
 function registeredSurfaceForPublication(surface, expectedCapability) {
@@ -4512,6 +4558,7 @@ async function applyCodexMenuSession(threadID = "", target = null, options = {})
     }
     scheduleDesktopWatchBurst(threadID, "menu_session.apply");
     let appliedSurface = null;
+    let permissionAutoConfirmed = false;
     if (applied && applied.surface) {
       const ownerKind = session.owner && session.owner.kind;
       const controlID = String(entry.control_id || (session.owner && session.owner.control_id) || "");
@@ -4522,6 +4569,10 @@ async function applyCodexMenuSession(threadID = "", target = null, options = {})
           : "";
       rememberControlCreatedSurface(threadID, applied.surface, capability);
       appliedSurface = capability ? registeredSurfaceForPublication(applied.surface, capability) : null;
+      if (appliedSurface && appliedSurface.capability === "permission_confirmation") {
+        permissionAutoConfirmed = await autoConfirmPermissionSurface(controller, threadID, appliedSurface);
+        if (permissionAutoConfirmed) appliedSurface = null;
+      }
     }
     // Model and reasoning menus do not expose a stable SDK option identity.
     // After the native click, read the closed composer once and return that
@@ -4537,6 +4588,7 @@ async function applyCodexMenuSession(threadID = "", target = null, options = {})
     const details = {};
     if (interactiveControls.length > 0) details.interactive_controls = cloneInteractiveControls(interactiveControls);
     if (appliedSurface) details.interactive_surface = appliedSurface;
+    if (permissionAutoConfirmed) details.permission_auto_confirmed = true;
     return {
       ok: true,
       action: "menu_session.apply",
@@ -6964,6 +7016,8 @@ module.exports = {
     waitForFreshCodexDraft,
     isCurrentAnonymousMobileDraft,
     rememberControlCreatedSurface,
+    confirmablePermissionAction,
+    applyCodexMenuSession,
     interactiveSurfaceForForeground,
     rolloutContainsVisibilityMarker,
     runtimeWithLiveQueue,
