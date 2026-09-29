@@ -1240,8 +1240,25 @@ function closedComposerControlsExpression() {
       return Boolean(rect && rect.width > 0 && rect.height > 0);
     };
     const textOf = (el) => String(el && (el.innerText || el.textContent) || '').replace(/\\s+/g, ' ').trim();
+    // The desktop ModelPicker stacks every reasoning-effort layer inside the
+    // closed trigger (aria-hidden spans cross-faded via opacity), so innerText
+    // concatenates all options. The accessible value is what survives without
+    // the aria-hidden nodes: the model name leaf plus the sr-only current
+    // effort label, e.g. "GPT-6 Sol 中".
+    const stackedPickerValueOf = (el) => {
+      if (!el.querySelector('[data-reasoning-effort]') && !el.hasAttribute('data-selected-reasoning-effort')) return '';
+      const clone = el.cloneNode(true);
+      clone.querySelectorAll('[aria-hidden="true"]').forEach((node) => node.remove());
+      return [...clone.querySelectorAll('span')]
+        .filter((node) => node.children.length === 0)
+        .map((node) => textOf(node))
+        .filter(Boolean)
+        .join(' ');
+    };
     const valueOf = (el) => {
       if (!el) return '';
+      const stacked = stackedPickerValueOf(el);
+      if (stacked) return stacked;
       const root = el.querySelector(':scope > div') || el;
       const values = [...root.children]
         .filter((child) => child.tagName === 'SPAN')
@@ -3642,13 +3659,26 @@ class CodexDesktopController extends CdpPageClient {
   async composerControlState() {
     return this.evaluate(`(() => {
       const textOf = (el) => (el ? (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim() : '');
+      // Mirrors closedComposerControlsExpression: the stacked ModelPicker
+      // trigger hides all non-current effort layers behind aria-hidden, so the
+      // readable label is the model-name leaf plus the sr-only current effort.
+      const stackedPickerParts = (el) => {
+        if (!el || (!el.querySelector('[data-reasoning-effort]') && !el.hasAttribute('data-selected-reasoning-effort'))) return [];
+        const clone = el.cloneNode(true);
+        clone.querySelectorAll('[aria-hidden="true"]').forEach((node) => node.remove());
+        return [...clone.querySelectorAll('span')]
+          .filter((node) => node.children.length === 0)
+          .map((node) => textOf(node))
+          .filter(Boolean);
+      };
       const permission = document.querySelector('[data-composer-navigation-target="permissions"]');
       const intelligence = document.querySelector('[data-codex-intelligence-trigger="true"]');
       const effortAttr = intelligence ? (intelligence.getAttribute('data-selected-reasoning-effort') || '').trim() : '';
+      const pickerParts = stackedPickerParts(intelligence);
       return {
         permission: textOf(permission),
-        intelligence: textOf(intelligence),
-        model: '',
+        intelligence: pickerParts.length ? pickerParts.join(' ') : textOf(intelligence),
+        model: pickerParts[0] || '',
         reasoning: effortAttr,
         reasoningLabel: effortAttr,
         reasoningEffort: effortAttr,
