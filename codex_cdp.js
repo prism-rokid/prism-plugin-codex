@@ -1129,6 +1129,60 @@ function flatIntelligenceModelGroup(rows) {
   };
 }
 
+// The desktop intelligence menu renders effort selection as a slider row
+// (role=menuitem with data-reasoning-slider). Its thumb input mounts lazily,
+// but the row itself owns the ArrowLeft/ArrowRight keyboard control, and a
+// live region announces "<model> <level name>，第 N 项，共 M 项。" — the only
+// authoritative source for the current level, the level count, and the
+// localized name of the current level. Focusing the row is a prerequisite for
+// the trusted arrow-key presses dispatched by applyReasoningEffortIndex.
+function reasoningSliderFactsExpression() {
+  return `(() => {
+    const row = document.querySelector('[data-reasoning-slider="true"]');
+    if (!row) return null;
+    const rect = row.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+    row.focus && row.focus();
+    const announcement = [...document.querySelectorAll('[role="status"]')]
+      .map((el) => String(el.textContent || '').replace(/\\s+/g, ' ').trim())
+      .filter(Boolean)
+      .find((text) => /第\\s*\\d+\\s*项/.test(text)) || '';
+    const match = announcement.match(/^(.*?)[，,]\\s*第\\s*(\\d+)\\s*项[，,]\\s*共\\s*(\\d+)\\s*项/) || null;
+    const prefixParts = match ? match[1].trim().split(/\\s+/).filter(Boolean) : [];
+    const trigger = document.querySelector('[data-codex-intelligence-trigger="true"]');
+    return {
+      index: match ? Math.max(0, Number(match[2]) - 1) : -1,
+      total: match ? Math.max(0, Number(match[3])) : 0,
+      label: prefixParts.length > 1 ? prefixParts[prefixParts.length - 1] : '',
+      announcement,
+      effortValue: trigger ? String(trigger.getAttribute('data-selected-reasoning-effort') || '').trim() : '',
+    };
+  })()`;
+}
+
+const EFFORT_CONTROL_ID = "codex.intelligence.effort";
+
+// Facts come from the slider live region; only the current level carries a
+// localized name, so every other level is addressed by its 1-based ordinal.
+function reasoningEffortRowsFromFacts(facts) {
+  if (!facts || typeof facts !== "object") return [];
+  const total = Number(facts.total) || 0;
+  const index = Number(facts.index);
+  if (!total || !Number.isInteger(index) || index < 0 || index >= total) return [];
+  const currentLabel = String(facts.label || "").trim();
+  const rows = [];
+  for (let level = 0; level < total; level += 1) {
+    rows.push({
+      index: level,
+      optionId: `${EFFORT_CONTROL_ID}:${level}`,
+      label: level === index && currentLabel ? currentLabel : `档位 ${level + 1}`,
+      checked: level === index,
+      disabled: false,
+    });
+  }
+  return rows;
+}
+
 function intelligenceSubmenuRowsExpression(controlID) {
   return `(() => {
     const controlID = ${JSON.stringify(String(controlID || ''))};
@@ -1245,26 +1299,31 @@ function closedComposerControlsExpression() {
     // concatenates all options. The accessible value is what survives without
     // the aria-hidden nodes: the model name leaf plus the sr-only current
     // effort label, e.g. "GPT-6 Sol 中".
-    const stackedPickerValueOf = (el) => {
-      if (!el.querySelector('[data-reasoning-effort]') && !el.hasAttribute('data-selected-reasoning-effort')) return '';
+    const stackedPickerPartsOf = (el) => {
+      if (!el || (!el.querySelector('[data-reasoning-effort]') && !el.hasAttribute('data-selected-reasoning-effort'))) return [];
       const clone = el.cloneNode(true);
       clone.querySelectorAll('[aria-hidden="true"]').forEach((node) => node.remove());
       return [...clone.querySelectorAll('span')]
         .filter((node) => node.children.length === 0)
         .map((node) => textOf(node))
-        .filter(Boolean)
-        .join(' ');
+        .filter(Boolean);
     };
     const valueOf = (el) => {
       if (!el) return '';
-      const stacked = stackedPickerValueOf(el);
-      if (stacked) return stacked;
+      const stacked = stackedPickerPartsOf(el);
+      if (stacked.length) return stacked.join(' ');
       const root = el.querySelector(':scope > div') || el;
       const values = [...root.children]
         .filter((child) => child.tagName === 'SPAN')
         .map((child) => textOf(child))
         .filter(Boolean);
       return values[values.length - 1] || textOf(el);
+    };
+    // The last stacked leaf is the sr-only current effort name (e.g. "中"),
+    // which is also the value published by the dedicated effort control.
+    const effortNameOf = (el) => {
+      const parts = stackedPickerPartsOf(el);
+      return parts.length > 1 ? parts[parts.length - 1] : '';
     };
     const permission = document.querySelector('[data-composer-navigation-target="permissions"]');
     const intelligence = document.querySelector('[data-codex-intelligence-trigger="true"]');
@@ -1275,6 +1334,8 @@ function closedComposerControlsExpression() {
       } : null,
       intelligence: intelligence && visible(intelligence) ? {
         controlId: 'codex.intelligence', currentValue: valueOf(intelligence),
+        effort: effortNameOf(intelligence),
+        effortValue: String(intelligence.getAttribute('data-selected-reasoning-effort') || '').trim(),
       } : null,
     };
   })()`;
@@ -3117,6 +3178,93 @@ class CodexDesktopController extends CdpPageClient {
     return groups;
   }
 
+  // Reasoning effort lives in a native slider row inside the intelligence
+  // menu. Levels are addressed by their zero-based announcement index. The
+  // localized level name is only knowable for the current level, so other
+  // rows carry an ordinal label and the panel renders them positionally.
+  async readReasoningEffortFacts() {
+    return this.evaluate(reasoningSliderFactsExpression());
+  }
+
+  async reasoningEffortRows() {
+    return reasoningEffortRowsFromFacts(await this.readReasoningEffortFacts());
+  }
+
+  async openReasoningSlider() {
+    await this.openIntelligenceMenu();
+    await this.waitFor(`(() => {
+      const facts = ${reasoningSliderFactsExpression()};
+      return Boolean(facts && facts.total > 0 && facts.index >= 0);
+    })()`, DEFAULT_ACTION_TIMEOUT_MS, 120);
+  }
+
+  async listReasoningEffortOptions(keepOpen = false) {
+    await this.openReasoningSlider();
+    try {
+      const rows = await this.reasoningEffortRows();
+      if (!rows.length) {
+        throw new Error("control_target_stale: reasoning effort slider is not readable");
+      }
+      return rows;
+    } finally {
+      if (!keepOpen) await this.closeVisibleMenus();
+    }
+  }
+
+  async reasoningSliderKey(key, code, windowsVirtualKeyCode) {
+    await this.send("Input.dispatchKeyEvent", {
+      type: "rawKeyDown",
+      key,
+      code,
+      windowsVirtualKeyCode,
+      nativeVirtualKeyCode: windowsVirtualKeyCode,
+    });
+    await this.send("Input.dispatchKeyEvent", {
+      type: "keyUp",
+      key,
+      code,
+      windowsVirtualKeyCode,
+      nativeVirtualKeyCode: windowsVirtualKeyCode,
+    });
+  }
+
+  async applyReasoningEffortIndex(optionID = "", expectedRows = []) {
+    const requestedOptionID = String(optionID || "").trim();
+    await this.openReasoningSlider();
+    try {
+      const rows = await this.reasoningEffortRows();
+      if (!sameComposerMenuRows(rows, expectedRows)) {
+        throw new Error("control_target_stale: reasoning effort slider structure changed");
+      }
+      const matches = rows.filter((row) => row && row.optionId === requestedOptionID && !row.disabled);
+      if (matches.length !== 1) {
+        throw new Error("control_target_stale: reasoning effort option is not uniquely present in the current desktop menu");
+      }
+      const targetIndex = Number(matches[0].index);
+      const before = await this.readReasoningEffortFacts();
+      const stepKey = targetIndex >= before.index
+        ? { key: "ArrowRight", code: "ArrowRight", windowsVirtualKeyCode: 39 }
+        : { key: "ArrowLeft", code: "ArrowLeft", windowsVirtualKeyCode: 37 };
+      for (let step = 0; step < Math.abs(targetIndex - before.index); step += 1) {
+        await this.reasoningSliderKey(stepKey.key, stepKey.code, stepKey.windowsVirtualKeyCode);
+        await sleep(140);
+      }
+      const deadline = Date.now() + 2000;
+      let facts = null;
+      do {
+        facts = await this.readReasoningEffortFacts();
+        if (facts && facts.index === targetIndex) break;
+        await sleep(120);
+      } while (Date.now() < deadline);
+      if (!facts || facts.index !== targetIndex) {
+        throw new Error("control_target_stale: reasoning effort slider did not reach the requested level");
+      }
+      return { index: facts.index, total: facts.total, label: facts.label, effort_value: facts.effortValue };
+    } finally {
+      await this.closeVisibleMenus();
+    }
+  }
+
   async conversationHeaderMenuAvailable() {
     await this.ensureReady();
     return this.evaluate(conversationHeaderMenuAvailableExpression()).catch(() => false);
@@ -3371,12 +3519,17 @@ class CodexDesktopController extends CdpPageClient {
           if (surface) break;
           await sleep(80);
         } while (Date.now() < deadline);
-      } finally {
-        if (!surface) await this.closeVisibleMenus();
+        } finally {
+          if (!surface) await this.closeVisibleMenus();
+        }
+        return { surface };
       }
-      return { surface };
-    }
-    if (normalizedControlID === FLAT_INTELLIGENCE_MODEL_CONTROL_ID) {
+      if (normalizedControlID === EFFORT_CONTROL_ID) {
+        // The effort slider opens, steps, and closes its own native menu.
+        const applied = await this.applyReasoningEffortIndex(optionID, expectedRows);
+        return { surface: await this.readInteractiveSurface(), effort: applied };
+      }
+      if (normalizedControlID === FLAT_INTELLIGENCE_MODEL_CONTROL_ID) {
       await this.openIntelligenceMenu();
       try {
         const rows = await this.evaluate(flatIntelligenceMenuRowsExpression());
@@ -3817,6 +3970,9 @@ module.exports = {
     loopbackListeningPorts,
     flatIntelligenceMenuRowsExpression,
     flatIntelligenceModelGroup,
+    reasoningSliderFactsExpression,
+    reasoningEffortRowsFromFacts,
+    EFFORT_CONTROL_ID,
     FLAT_INTELLIGENCE_MODEL_CONTROL_ID,
   },
 };

@@ -4318,6 +4318,16 @@ async function readCodexInteractiveControls(controller) {
     ["model", "reasoning"],
   );
   if (intelligenceControl) controls.push(intelligenceControl);
+  // The stacked ModelPicker makes the current effort independently readable
+  // from the closed trigger, so publish it as its own control next to the
+  // combined model label.
+  const effortControl = dynamicInteractiveControl(
+    "codex.intelligence.effort",
+    "推理强度",
+    intelligence && intelligence.effort,
+    ["reasoning"],
+  );
+  if (effortControl) controls.push(effortControl);
   const permission = closed && closed.permission;
   // Codex renders only the current permission value. The stable DOM anchor is
   // technical (`permissions`), while this fixed product label keeps the
@@ -4488,6 +4498,9 @@ async function describeCodexMenuSession(threadID = "", owner = null, options = {
       }
       if (controlID === "codex.intelligence") {
         return { rows: [], groups: await controller.listIntelligenceMenuGroups() };
+      }
+      if (controlID === "codex.intelligence.effort") {
+        return { rows: await controller.listReasoningEffortOptions(), groups: [] };
       }
       return { rows: await controller.listIntelligenceControlOptions(controlID), groups: [] };
     });
