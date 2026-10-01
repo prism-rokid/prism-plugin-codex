@@ -272,7 +272,7 @@ test("composer submission uses the same root as native text insertion", () => {
   const cdpSource = fs.readFileSync(path.join(__dirname, "..", "codex_cdp.js"), "utf8");
 
   assert.match(cdpSource, /function composerContainerElementExpression\(\)/);
-  assert.match(cdpSource, /const root = document\.querySelector\('\[data-codex-composer-root\]'\)/);
+  assert.ok(cdpSource.includes("const root = ${visibleDesktopElementExpression('[data-codex-composer-root]')}"));
   assert.match(cdpSource, /const composer = \$\{composerContainerElementExpression\(\)\};/);
 });
 

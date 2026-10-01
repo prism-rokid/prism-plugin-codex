@@ -81,7 +81,7 @@ function readGoalPlanState(buttons, { goalIcon = null } = {}) {
   });
   const document = {
     querySelector: (selector) => selector === "[data-codex-composer-root]" ? composer : null,
-    querySelectorAll: (selector) => selector === "svg" && goalIcon ? [goalIcon] : [],
+    querySelectorAll: (selector) => selector === "[data-codex-composer-root]" ? [composer] : selector === "svg" && goalIcon ? [goalIcon] : [],
   };
   return vm.runInNewContext(
     `(() => { ${__test.goalPlanDOMHelpersSource()} return prismGoalPlanState(); })()`,

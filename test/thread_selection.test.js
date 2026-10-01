@@ -89,7 +89,7 @@ test("composer control readiness is a read-only check scoped to the selected thr
   });
   assert.match(script, /data-above-composer-conversation-id/);
   assert.match(script, /data-codex-intelligence-trigger/);
-  assert.match(script, /data-composer-navigation-target="permissions"/);
+  assert.match(script.replace(/\\"/g, '"'), /data-composer-navigation-target="permissions"/);
   assert.match(script, new RegExp(THREAD_ID));
   assert.doesNotMatch(script, /\.click\(/);
   assert.doesNotMatch(script, /dispatchEvent/);
@@ -349,6 +349,7 @@ test("flat model session describe reads direct menuitemradio rows and closes the
   };
   controller.closeVisibleMenus = async () => { closed += 1; };
 
+  controller.reasoningEffortRows = async () => [];
   const groups = await controller.listIntelligenceMenuGroups();
   assert.equal(opened, 1);
   assert.equal(closed, 1);
@@ -508,4 +509,72 @@ test("history retains Codex commentary-phase progress messages", () => {
   assert.equal(__test.isDesktopVisibleAssistantMessage({ phase: "commentary" }), true);
   assert.equal(__test.isDesktopVisibleAssistantMessage({ phase: "final_answer" }), true);
   assert.equal(__test.isDesktopVisibleAssistantMessage({}), true);
+});
+
+test("foreground detection skips retained hidden conversation trees", async () => {
+  const vm = require("node:vm");
+  const controller = selectionController({
+    evaluate: async (source) => vm.runInNewContext(source, {
+      document: {
+        querySelectorAll: () => [
+          { parentElement: { getBoundingClientRect: () => ({ width: 0, height: 0 }) }, getAttribute: () => "22222222-2222-4222-8222-222222222222" },
+          { parentElement: { getBoundingClientRect: () => ({ width: 800, height: 100 }) }, getAttribute: () => THREAD_ID },
+        ],
+      },
+    }),
+  });
+  assert.equal(await controller.currentThreadId(), THREAD_ID);
+  assert.equal(await CodexDesktopController.prototype.isThreadSelected.call(controller, THREAD_ID), true);
+});
+
+test("foreground detection returns empty when all conversation trees are hidden", async () => {
+  const vm = require("node:vm");
+  const controller = selectionController({
+    evaluate: async (source) => vm.runInNewContext(source, {
+      document: { querySelectorAll: () => [{ parentElement: { getBoundingClientRect: () => ({ width: 0, height: 0 }) }, getAttribute: () => THREAD_ID }] },
+    }),
+  });
+  assert.equal(await controller.currentThreadId(), "");
+});
+
+test("Composer and menu controls skip retained hidden duplicates", () => {
+  const vm = require("node:vm");
+  const hidden = { getBoundingClientRect: () => ({ width: 0, height: 0 }) };
+  const visible = { getBoundingClientRect: () => ({ width: 800, height: 100 }) };
+  for (const selector of ["[data-codex-composer-root]", '[data-codex-intelligence-trigger="true"]', '[data-composer-navigation-target="permissions"]']) {
+    const context = { document: { querySelectorAll: (requested) => {
+      assert.equal(requested, selector);
+      return [hidden, visible];
+    } } };
+    assert.equal(vm.runInNewContext(cdpTest.visibleDesktopElementExpression(selector), context), visible);
+  }
+  assert.equal(vm.runInNewContext(cdpTest.composerContainerElementExpression(), {
+    document: { querySelectorAll: () => [hidden, visible] },
+  }), visible);
+});
+
+test("flat model menu includes the native reasoning slider group", async () => {
+  const controller = Object.create(CodexDesktopController.prototype);
+  const modelRows = [{ optionId: "model", checked: true, label: "Model" }];
+  const effortRows = cdpTest.reasoningEffortRowsFromFacts({ total: 5, index: 1, label: "中" });
+  let closed = false;
+  controller.openIntelligenceMenu = async () => {};
+  controller.intelligenceRootControls = async () => [];
+  controller.reasoningEffortRows = async () => { assert.equal(closed, false); return effortRows; };
+  controller.evaluate = async () => modelRows;
+  controller.closeVisibleMenus = async () => { closed = true; };
+  const groups = await controller.listIntelligenceMenuGroups();
+  assert.equal(groups.length, 2);
+  assert.deepEqual(groups[1], { control_id: cdpTest.EFFORT_CONTROL_ID, label: "推理强度", rows: effortRows });
+  assert.equal(closed, true);
+});
+
+test("reasoning options use native efforts and lock state rather than ordinal placeholders", () => {
+  const rows = cdpTest.reasoningEffortRowsFromFacts({ total: 3, index: 0, label: "轻度", selections: [
+    { id: "model:low", model: "model", reasoningEffort: "low", disabled: false },
+    { id: "model:high", model: "model", reasoningEffort: "high", disabled: false },
+    { id: "model:ultra", model: "model", reasoningEffort: "ultra", disabled: true },
+  ] });
+  assert.deepEqual(rows.map(row => row.label), ["low", "high", "ultra"]);
+  assert.deepEqual(rows.map(row => row.disabled), [false, false, true]);
 });

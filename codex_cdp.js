@@ -84,7 +84,7 @@ function goalPlanDOMHelpersSource() {
     };
     const prismGoalState = () => {
       const card = prismGoalCard();
-      const composerRoot = document.querySelector('[data-codex-composer-root]');
+      const composerRoot = ${visibleDesktopElementExpression('[data-codex-composer-root]')};
       if (!card) return { status: 'none', objective: '', available: Boolean(prismVisible(composerRoot)) };
       const paused = Boolean(prismGoalControl('resume'));
       // Current Codex renders the goal summary as its own button in the card:
@@ -122,7 +122,7 @@ function goalPlanDOMHelpersSource() {
       };
     };
     const prismPlanIndicator = () => {
-      const composerRoot = document.querySelector('[data-codex-composer-root]');
+      const composerRoot = ${visibleDesktopElementExpression('[data-codex-composer-root]')};
       if (!prismVisible(composerRoot)) return null;
       const candidates = [...composerRoot.querySelectorAll('button')]
         .filter(prismVisible)
@@ -131,7 +131,7 @@ function goalPlanDOMHelpersSource() {
       return candidates.length === 1 ? candidates[0] : null;
     };
     const prismGoalPlanState = () => ({
-      plan_mode: { enabled: Boolean(prismPlanIndicator()), available: Boolean(prismVisible(document.querySelector('[data-codex-composer-root]'))) },
+      plan_mode: { enabled: Boolean(prismPlanIndicator()), available: Boolean(prismVisible(${visibleDesktopElementExpression('[data-codex-composer-root]')})) },
       goal: prismGoalState(),
     });
   `;
@@ -174,7 +174,7 @@ function goalComposerSubmitElementExpression() {
       }
       return hasPrimaryContract && ownerCount === 1;
     };
-    const root = document.querySelector('[data-codex-composer-root]');
+    const root = ${visibleDesktopElementExpression('[data-codex-composer-root]')};
     if (!visible(root)) return null;
     // The Goal command replaces the regular footer navigation with its own
     // editor. Its confirmation is still the normal uniquely-owned Composer
@@ -189,13 +189,22 @@ function goalComposerSubmitElementExpression() {
   })()`;
 }
 
+// Retained inactive conversation trees contain the same Composer selectors.
+// Resolve controls by their rendered box before reading or activating them.
+function visibleDesktopElementExpression(selector) {
+  return `(() => [...document.querySelectorAll(${JSON.stringify(selector)})].find((element) => {
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }) || null)()`;
+}
+
 function composerEditableElementExpression() {
   return `(() => {
     const visible = (element) => {
       const rect = element && element.getBoundingClientRect();
       return Boolean(rect && rect.width > 0 && rect.height > 0);
     };
-    const root = document.querySelector('[data-codex-composer-root]');
+    const root = ${visibleDesktopElementExpression('[data-codex-composer-root]')};
     if (!visible(root)) return null;
     const editableCandidates = [
       ...root.querySelectorAll('textarea, input:not([type="hidden"]), [contenteditable="true"]'),
@@ -227,9 +236,9 @@ function composerContainerElementExpression() {
       const rect = element && element.getBoundingClientRect();
       return Boolean(rect && rect.width > 0 && rect.height > 0);
     };
-    const legacy = document.querySelector('[data-codex-composer="true"], [data-codex-composer]');
+    const legacy = ${visibleDesktopElementExpression('[data-codex-composer="true"], [data-codex-composer]')};
     if (visible(legacy)) return legacy;
-    const root = document.querySelector('[data-codex-composer-root]');
+    const root = ${visibleDesktopElementExpression('[data-codex-composer-root]')};
     return visible(root) ? root : null;
   })()`;
 }
@@ -929,7 +938,14 @@ function foregroundThreadIdExpression() {
       const match = text.match(/(^|:)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
       return match && match[2] ? match[2] : text;
     };
-    const foreground = document.querySelector('[data-above-composer-conversation-id]');
+    // Codex retains inactive conversation trees. The marker itself is always
+    // display:none, so visibility must be checked on its layout parent.
+    const candidates = [...document.querySelectorAll('[data-above-composer-conversation-id]')];
+    const foreground = candidates.find((marker) => {
+      const parent = marker.parentElement;
+      const rect = parent && parent.getBoundingClientRect();
+      return Boolean(rect && rect.width > 0 && rect.height > 0);
+    });
     return normalizeThreadId(foreground && foreground.getAttribute('data-above-composer-conversation-id'));
   })()`;
 }
@@ -953,7 +969,7 @@ function visiblePermissionMenuRowsExpression() {
       }
       return hash.toString(16).padStart(16, '0');
     };
-    const trigger = document.querySelector('[data-composer-navigation-target="permissions"]');
+    const trigger = ${visibleDesktopElementExpression('[data-composer-navigation-target="permissions"]')};
     if (!trigger) return [];
     const isMenuRow = (el) => ['menuitem', 'menuitemradio', 'menuitemcheckbox', 'option']
       .includes(String(el && el.getAttribute('role') || '').toLowerCase());
@@ -1047,7 +1063,7 @@ function intelligenceRootControlsExpression() {
       const rect = el && el.getBoundingClientRect();
       return Boolean(rect && rect.width > 0 && rect.height > 0);
     };
-    const trigger = document.querySelector('[data-codex-intelligence-trigger="true"]');
+    const trigger = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
     if (!trigger) return [];
     const rootRows = (menu) => [...menu.querySelectorAll('[role]')]
       .filter((el) => el.closest('[role="menu"]') === menu)
@@ -1080,7 +1096,7 @@ const FLAT_INTELLIGENCE_MODEL_CONTROL_ID = "codex.intelligence.flat-model";
 // menu, instead of exposing model/reasoning submenu roots with aria-controls.
 function flatIntelligenceMenuRowsExpression() {
   return `(() => {
-    const trigger = document.querySelector('[data-codex-intelligence-trigger="true"]');
+    const trigger = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
     if (!trigger) return [];
     const visible = (el) => {
       const rect = el && el.getBoundingClientRect();
@@ -1138,7 +1154,7 @@ function flatIntelligenceModelGroup(rows) {
 // the trusted arrow-key presses dispatched by applyReasoningEffortIndex.
 function reasoningSliderFactsExpression() {
   return `(() => {
-    const row = document.querySelector('[data-reasoning-slider="true"]');
+    const row = ${visibleDesktopElementExpression('[data-reasoning-slider="true"]')};
     if (!row) return null;
     const rect = row.getBoundingClientRect();
     if (!rect || rect.width <= 0 || rect.height <= 0) return null;
@@ -1149,8 +1165,23 @@ function reasoningSliderFactsExpression() {
       .find((text) => /第\\s*\\d+\\s*项/.test(text)) || '';
     const match = announcement.match(/^(.*?)[，,]\\s*第\\s*(\\d+)\\s*项[，,]\\s*共\\s*(\\d+)\\s*项/) || null;
     const prefixParts = match ? match[1].trim().split(/\\s+/).filter(Boolean) : [];
-    const trigger = document.querySelector('[data-codex-intelligence-trigger="true"]');
+    const trigger = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
+    let selections = [];
+    let fiber = row[Object.keys(row).find((key) => key.startsWith('__reactFiber$'))];
+    for (let depth = 0; fiber && depth < 24; depth += 1, fiber = fiber.return) {
+      const props = fiber.memoizedProps;
+      if (!Array.isArray(props && props.powerSelections)) continue;
+      selections = props.powerSelections.map((selection) => ({
+        id: String(selection.id || ''),
+        model: String(selection.model || ''),
+        modelLabel: String(selection.modelLabel || ''),
+        reasoningEffort: String(selection.reasoningEffort || ''),
+        disabled: selection.isLocked === true || props.disabled === true,
+      }));
+      break;
+    }
     return {
+      selections,
       index: match ? Math.max(0, Number(match[2]) - 1) : -1,
       total: match ? Math.max(0, Number(match[3])) : 0,
       label: prefixParts.length > 1 ? prefixParts[prefixParts.length - 1] : '',
@@ -1170,14 +1201,20 @@ function reasoningEffortRowsFromFacts(facts) {
   const index = Number(facts.index);
   if (!total || !Number.isInteger(index) || index < 0 || index >= total) return [];
   const currentLabel = String(facts.label || "").trim();
+  const selections = Array.isArray(facts.selections) && facts.selections.length === total
+    && facts.selections.every((selection) => selection && selection.id && selection.reasoningEffort)
+    ? facts.selections : null;
+  const mixedModels = selections && new Set(selections.map((selection) => selection.model)).size > 1;
   const rows = [];
   for (let level = 0; level < total; level += 1) {
     rows.push({
       index: level,
       optionId: `${EFFORT_CONTROL_ID}:${level}`,
-      label: level === index && currentLabel ? currentLabel : `档位 ${level + 1}`,
+      label: selections
+        ? (mixedModels ? `${selections[level].modelLabel || selections[level].model} · ${selections[level].reasoningEffort}` : selections[level].reasoningEffort)
+        : level === index && currentLabel ? currentLabel : `档位 ${level + 1}`,
       checked: level === index,
-      disabled: false,
+      disabled: selections ? selections[level].disabled === true : false,
     });
   }
   return rows;
@@ -1215,7 +1252,7 @@ function intelligenceSubmenuRowsExpression(controlID) {
         '[data-state="checked"], [data-state="selected"], [data-checked="true"], [data-selected="true"]'
       ));
     };
-    const trigger = document.querySelector('[data-codex-intelligence-trigger="true"]');
+    const trigger = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
     if (!trigger) return [];
     const rootRows = (menu) => [...menu.querySelectorAll('[role]')]
       .filter((el) => el.closest('[role="menu"]') === menu)
@@ -1325,8 +1362,8 @@ function closedComposerControlsExpression() {
       const parts = stackedPickerPartsOf(el);
       return parts.length > 1 ? parts[parts.length - 1] : '';
     };
-    const permission = document.querySelector('[data-composer-navigation-target="permissions"]');
-    const intelligence = document.querySelector('[data-codex-intelligence-trigger="true"]');
+    const permission = ${visibleDesktopElementExpression('[data-composer-navigation-target="permissions"]')};
+    const intelligence = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
     return {
       permission: permission && visible(permission) ? {
         controlId: 'codex.permission', currentValue: valueOf(permission),
@@ -1861,7 +1898,7 @@ class CodexDesktopController extends CdpPageClient {
       };
       const isPermissionMenuRow = (target) => {
         const row = target && target.closest && target.closest('[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], [role="option"]');
-        const trigger = document.querySelector('[data-composer-navigation-target="permissions"]');
+        const trigger = ${visibleDesktopElementExpression('[data-composer-navigation-target="permissions"]')};
         if (!row || !trigger || !visible(trigger)) return false;
         const menu = row.closest('[role="menu"], [role="listbox"]');
         if (!menu || !visible(menu)) return false;
@@ -3047,7 +3084,7 @@ class CodexDesktopController extends CdpPageClient {
       if (!composer) return false;
       const rect = composer.getBoundingClientRect();
       if (!rect || rect.width <= 0 || rect.height <= 0 || composer.getAttribute('aria-disabled') === 'true') return false;
-      const current = normalizeThreadId(document.querySelector('[data-above-composer-conversation-id]')?.getAttribute('data-above-composer-conversation-id'));
+      const current = ${foregroundThreadIdExpression()};
       return current !== ${JSON.stringify(previous)};
     })()`, timeoutMs, 100);
   }
@@ -3055,21 +3092,21 @@ class CodexDesktopController extends CdpPageClient {
   async openPermissionMenu() {
     await this.ensureReady();
     await this.closeVisibleMenus();
-    const script = `(() => document.querySelector('[data-composer-navigation-target="permissions"]'))()`;
+    const script = `(() => ${visibleDesktopElementExpression('[data-composer-navigation-target="permissions"]')})()`;
     await this.clickElement(script);
     await this.waitFor(`(${visiblePermissionMenuRowsExpression()}).length > 0`, DEFAULT_ACTION_TIMEOUT_MS);
   }
 
   async openIntelligenceMenu() {
     await this.ensureReady();
-    const script = `(() => document.querySelector('[data-codex-intelligence-trigger=\"true\"]'))()`;
+    const script = `(() => ${visibleDesktopElementExpression('[data-codex-intelligence-trigger=\"true\"]')})()`;
     let lastError = null;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       await this.closeVisibleMenus();
       await this.clickElement(script);
       try {
         await this.waitFor(`(() => {
-          const trigger = document.querySelector('[data-codex-intelligence-trigger="true"]');
+          const trigger = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
           if (!trigger || trigger.getAttribute('aria-expanded') !== 'true') return false;
           const visible = (el) => {
             const rect = el && el.getBoundingClientRect();
@@ -3152,9 +3189,11 @@ class CodexDesktopController extends CdpPageClient {
     await this.openIntelligenceMenu();
     let controls;
     let flatRows = [];
+    let effortRows = [];
     try {
       controls = await this.intelligenceRootControls();
       if (!Array.isArray(controls) || controls.length === 0) {
+        effortRows = await this.reasoningEffortRows();
         flatRows = await this.evaluate(flatIntelligenceMenuRowsExpression());
       }
     } finally {
@@ -3163,7 +3202,9 @@ class CodexDesktopController extends CdpPageClient {
     if (!Array.isArray(controls) || !controls.length) {
       const flatGroup = flatIntelligenceModelGroup(flatRows);
       if (!flatGroup) throw new Error("control_target_stale: intelligence menu has no readable groups");
-      return [flatGroup];
+      return effortRows.length
+        ? [flatGroup, { control_id: EFFORT_CONTROL_ID, label: "推理强度", rows: effortRows }]
+        : [flatGroup];
     }
     const groups = [];
     for (const control of controls) {
@@ -3426,7 +3467,7 @@ class CodexDesktopController extends CdpPageClient {
       };
       const isMenuRow = (el) => ['menuitem', 'menuitemradio', 'menuitemcheckbox', 'option']
         .includes(String(el && el.getAttribute('role') || '').toLowerCase());
-      const trigger = document.querySelector('[data-composer-navigation-target="permissions"]');
+      const trigger = ${visibleDesktopElementExpression('[data-composer-navigation-target="permissions"]')};
       if (!trigger) return null;
       const menuID = String(trigger.getAttribute('aria-controls') || '').trim();
       const menus = [
@@ -3468,7 +3509,7 @@ class CodexDesktopController extends CdpPageClient {
         el.getAttribute('aria-haspopup') === 'menu' && el.hasAttribute('aria-controls');
       const isMenuRow = (el) => ['menuitem', 'menuitemradio', 'menuitemcheckbox', 'option']
         .includes(String(el && el.getAttribute('role') || '').toLowerCase());
-      const trigger = document.querySelector('[data-codex-intelligence-trigger="true"]');
+      const trigger = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
       if (!trigger) return null;
       const menus = [...document.querySelectorAll('[role="menu"]')].filter((menu) =>
         visible(menu) && [...menu.querySelectorAll('[role]')].some((el) => isRootRow(el, menu))
@@ -3541,7 +3582,7 @@ class CodexDesktopController extends CdpPageClient {
           throw new Error("control_target_stale: flat intelligence option is not uniquely present in the current desktop menu");
         }
         const target = `(() => {
-          const trigger = document.querySelector('[data-codex-intelligence-trigger="true"]');
+          const trigger = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
           if (!trigger) return null;
           const visible = (el) => {
             const rect = el && el.getBoundingClientRect();
@@ -3824,8 +3865,8 @@ class CodexDesktopController extends CdpPageClient {
           .map((node) => textOf(node))
           .filter(Boolean);
       };
-      const permission = document.querySelector('[data-composer-navigation-target="permissions"]');
-      const intelligence = document.querySelector('[data-codex-intelligence-trigger="true"]');
+      const permission = ${visibleDesktopElementExpression('[data-composer-navigation-target="permissions"]')};
+      const intelligence = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
       const effortAttr = intelligence ? (intelligence.getAttribute('data-selected-reasoning-effort') || '').trim() : '';
       const pickerParts = stackedPickerParts(intelligence);
       return {
@@ -3865,12 +3906,10 @@ class CodexDesktopController extends CdpPageClient {
         const match = text.match(/(^|:)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
         return match && match[2] ? match[2] : text;
       };
-      const selectedThreadId = normalizeThreadId(
-        document.querySelector('[data-above-composer-conversation-id]')?.getAttribute('data-above-composer-conversation-id')
-      );
+      const selectedThreadId = ${foregroundThreadIdExpression()};
       const composer = ${composerContainerElementExpression()};
-      const intelligence = document.querySelector('[data-codex-intelligence-trigger="true"]');
-      const permission = document.querySelector('[data-composer-navigation-target="permissions"]');
+      const intelligence = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
+      const permission = ${visibleDesktopElementExpression('[data-composer-navigation-target="permissions"]')};
       return {
         selected: ${JSON.stringify(expectedThreadId)} ? selectedThreadId === ${JSON.stringify(expectedThreadId)} : Boolean(selectedThreadId),
         composer: visible(composer),
@@ -3967,6 +4006,8 @@ module.exports = {
     goalPlanDOMHelpersSource,
     goalComposerSubmitElementExpression,
     composerEditableElementExpression,
+    composerContainerElementExpression,
+    visibleDesktopElementExpression,
     loopbackListeningPorts,
     flatIntelligenceMenuRowsExpression,
     flatIntelligenceModelGroup,
