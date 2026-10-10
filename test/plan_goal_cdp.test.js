@@ -53,13 +53,16 @@ function goalSpan(text, children = []) {
   });
 }
 
-function activeGoalCard(objective = "Ship release", { includeEdit = true } = {}) {
+function activeGoalCard(objective = "Ship release", { includeEdit = true, wrappedSummary = false } = {}) {
   const goalIcon = goalPathElement("M9.96861 1.91681 current-goal");
-  const summary = goalButton("", [
+  const summarySpans = [
     goalSpan("Running"),
     { ...goalSpan(`${objective} dot`, [goalSpan(" dot ")]), childNodes: [{ nodeType: 3, nodeValue: objective }] },
     goalSpan("2m"),
-  ]);
+  ];
+  const summary = wrappedSummary
+    ? goalButton("M9.96861 1.91681 summary", [{ tagName: "SPAN", children: [] }, { tagName: "DIV", children: summarySpans }])
+    : goalButton("", summarySpans);
   const clear = goalButton("M10.6299 1.33496 clear");
   const pause = goalButton("M10.625 7.91667 pause");
   const edit = goalButton("M4.33496 11 edit");
@@ -159,4 +162,45 @@ test("Goal controls focus the unique editable composer child, not only the legac
   assert.match(expression, /editableCandidates\.length === 1/);
   assert.match(expression, /legacyCandidates\.length === 1/);
   assert.doesNotMatch(expression, /document\.querySelector\('\[data-codex-composer\]'\)/);
+});
+
+test("wrapped Goal summary reads objective without status, timer, or decorative dot", () => {
+  const state = readGoalPlanState([], activeGoalCard("Validate controls", { wrappedSummary: true }));
+  assert.equal(state.goal.objective, "Validate controls");
+  assert.equal(state.goal.status, "running");
+});
+
+test("new Plan indicator path remains a persistent toggle", () => {
+  const button = planButton();
+  button.querySelector = () => ({ getAttribute: () => "M8 3.80762 new-plan-path" });
+  assert.equal(readGoalPlanState([button]).plan_mode.enabled, true);
+});
+
+for (const [commandKey, iconPrefix] of [["goal", "M9.96861 1.91681"], ["plan-mode", "M8 3.52051C9.07134"]]) {
+  test(`iconless ${commandKey} command resolves by native row ownership`, async () => {
+    const controller = Object.create(CodexDesktopController.prototype);
+    const row = visibleElement({ querySelector: () => null });
+    row.__reactFiber$fixture = { key: null, return: { key: null, return: { key: commandKey } } };
+    const unrelated = visibleElement({ querySelector: () => null });
+    unrelated.__reactFiber$fixture = { key: "other-command" };
+    const context = { document: { querySelectorAll: () => [unrelated, row] } };
+    controller.options = {};
+    controller.setComposerText = async () => {};
+    controller.waitFor = async (source) => { assert.equal(vm.runInNewContext(source, context), true); };
+    controller.dispatchDomPointerClick = async (source) => { assert.equal(vm.runInNewContext(source, context), row); };
+    await controller.openSlashCommand(iconPrefix);
+  });
+}
+
+test("goal clear ignores a transient unmounted card and returns the settled snapshot", async () => {
+  const controller = Object.create(CodexDesktopController.prototype);
+  controller.options = { actionTimeoutMs: 1500 };
+  controller.ensureReady = async () => {};
+  controller.dispatchDomPointerClick = async () => {};
+  const paused = { status: "paused", actions: { resume: true } };
+  const absent = { status: "none", objective: "" };
+  const states = [paused, absent, paused, absent, absent, absent];
+  controller.goalPlanState = async () => ({ goal: states.shift() || paused });
+  assert.equal(await controller.controlGoal("goal.clear"), absent);
+  assert.equal(states.length, 0);
 });

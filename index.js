@@ -2455,6 +2455,8 @@ function isInternalUserEnvelope(text) {
     return false;
   }
   if (
+    (/^# AGENTS\.md instructions\s*(?:\r?\n|$)/.test(trimmed) && /<INSTRUCTIONS>[\s\S]*<\/INSTRUCTIONS>/.test(trimmed)) ||
+    (/^<external_codex_apps_open_page\b[^>]*>[\s\S]*<\/external_codex_apps_open_page>$/i.test(trimmed)) ||
     (trimmed.startsWith("<environment_context>") && trimmed.endsWith("</environment_context>")) ||
     (/^<codex_internal_context\b[^>]*>[\s\S]*<\/codex_internal_context>$/i.test(trimmed)) ||
     isTurnAbortedMarker(trimmed)
@@ -2475,6 +2477,7 @@ function isTurnAbortedMarker(text) {
 }
 
 function visibleUserHistoryText(text) {
+  if (isInternalUserEnvelope(text)) return "";
   return unwrapUserPromptText(text)
     .replace(/<environment_context>[\s\S]*?<\/environment_context>/gi, "")
     .replace(/<turn_aborted\b[\s\S]*(?:<\/turn_aborted>)?/gi, "")
@@ -3672,13 +3675,17 @@ function summarizeRolloutChunk(file, offset = 0) {
     return { summary: "", terminal: false, failed: false, interrupted: false, evidence: "" };
   }
   try {
-    const raw = fs.readFileSync(file, "utf8");
+    const raw = offset > 0 ? fs.readFileSync(file, "utf8")
+      : readRecentRolloutRows(file, 1).map((row) => JSON.stringify(row)).join("\n");
     const slice = offset > 0 ? raw.slice(offset) : raw;
     const lines = slice.split(/\r?\n/);
     let summary = "";
     let terminal = false;
     let failed = false;
     let interrupted = false;
+    let turnID = "";
+    let terminalID = "";
+    let terminalAt = "";
     for (const line of lines) {
       const trimmed = line.trim();
       if (!trimmed) continue;
@@ -3690,6 +3697,11 @@ function summarizeRolloutChunk(file, offset = 0) {
       }
       const payload = row && row.payload;
       if (!payload || typeof payload !== "object") continue;
+      if (row.type === "event_msg" && payload.type === "task_started") {
+        turnID = firstNonEmpty(payload.turn_id);
+        terminal = failed = interrupted = false;
+        terminalID = terminalAt = summary = "";
+      }
       if (row.type === "response_item" && payload.type === "message" && payload.role === "assistant") {
         const text = extractTextFromContent(payload.content);
         if (text) {
@@ -3707,8 +3719,13 @@ function summarizeRolloutChunk(file, offset = 0) {
         terminal = true;
         failed = true;
       }
+      if (row.type === "event_msg" && ["task_complete", "task_failed", "turn_aborted"].includes(payload.type)) {
+        terminalID = firstNonEmpty(payload.turn_id, turnID)
+          || `legacy:${crypto.createHash("sha256").update(JSON.stringify(row)).digest("hex").slice(0, 24)}`;
+        terminalAt = firstNonEmpty(row.timestamp);
+      }
     }
-    return { summary, terminal, failed, interrupted, evidence: file };
+    return { summary, terminal, failed, interrupted, evidence: file, terminalID, terminalAt };
   } catch {
     return { summary: "", terminal: false, failed: false, interrupted: false, evidence: file };
   }
@@ -5856,17 +5873,8 @@ function desktopWatchStatus(runtime = {}) {
 
 const DESKTOP_RUN_FILE_WATCH_POLL_MS = 2000;
 const DESKTOP_RUN_FILE_WATCH_TIMEOUT_MS = 30 * 60 * 1000;
-// Evidence-free fallback: same-status duplicates within this window are UI lag,
-// not a new run.
-const DESKTOP_TERMINAL_REARM_FALLBACK_MS = 10 * 1000;
-
-// Desktop-initiated runs never pass through the hub's forward-run waiter, so
-// their terminal push needs an explicit event here. Terminal state is data
-// state: it comes from the thread's rollout file, never from the foreground
-// watcher alone. Each emitted terminal records the rollout evidence (file
-// content length) it was based on; a later terminal with more evidence is a
-// genuinely new run. Desktop UI status lags the rollout data, so a non-
-// terminal UI status never disarms an emitted terminal.
+// Only a native task lifecycle establishes a terminal identity. Settings,
+// usage and UI observations can append bytes without starting another task.
 const desktopTerminalRunEmitted = new Map();
 
 // Evidence survives plugin restarts via the plugin state file: the hub
@@ -5884,7 +5892,7 @@ function hydrateDesktopTerminalRuns() {
       if (!["completed", "failed", "interrupted"].includes(status)) continue;
       desktopTerminalRunEmitted.set(threadID, {
         status,
-        evidence: Number(entry.evidence) || 0,
+        terminalID: String(entry.terminalID || ""),
         at: Number(entry.at) || 0,
       });
     }
@@ -5899,33 +5907,34 @@ function persistDesktopTerminalRuns() {
       .slice(0, DESKTOP_TERMINAL_RUN_STATE_LIMIT);
     const saved = {};
     for (const [threadID, entry] of entries) {
-      saved[threadID] = { status: entry.status, evidence: entry.evidence, at: entry.at };
+      saved[threadID] = { status: entry.status, terminalID: entry.terminalID, at: entry.at };
     }
     state.desktopTerminalRuns = saved;
     writePluginState(state);
   } catch {}
 }
 
-function desktopTerminalTransition(threadID, status, evidence = 0) {
+function desktopTerminalTransition(threadID, status, terminalID = "", terminalAt = "") {
   const normalized = String(status || "").toLowerCase();
-  if (!["completed", "failed", "interrupted"].includes(normalized)) {
+  if (!["completed", "failed", "interrupted"].includes(normalized) || !terminalID) {
     return null;
   }
   const recorded = desktopTerminalRunEmitted.get(threadID);
   if (recorded) {
-    const newerRun = normalized !== recorded.status
-      || (evidence > 0 && recorded.evidence > 0 && evidence > recorded.evidence)
-      || (evidence === 0 && recorded.evidence === 0 && Date.now() - recorded.at >= DESKTOP_TERMINAL_REARM_FALLBACK_MS);
-    if (!newerRun) return null;
+    if (recorded.terminalID === terminalID) return null;
+    // Upgrade the old byte-based record without replaying its settled task.
+    if (!recorded.terminalID && Date.parse(terminalAt) <= recorded.at) {
+      desktopTerminalRunEmitted.set(threadID, { ...recorded, terminalID });
+      return null;
+    }
   }
-  desktopTerminalRunEmitted.set(threadID, { status: normalized, evidence, at: Date.now() });
+  desktopTerminalRunEmitted.set(threadID, { status: normalized, terminalID, at: Date.now() });
   return normalized;
 }
 
 hydrateDesktopTerminalRuns();
 
-// Position marker for terminal dedup: the rollout file's size at detection
-// time. Bytes appended after a terminal belong to the next run.
+// Resolve rollout locations; file length is only a read cursor, never run identity.
 const rolloutPathCache = new Map();
 const ROLLOUT_PATH_CACHE_TTL_MS = 60 * 1000;
 
@@ -6032,11 +6041,11 @@ function desktopTerminalRunSummary(status, runSummary, latestSummary) {
   return firstNonEmpty(runSummary) || (status === "interrupted" ? "Codex 任务已被打断。" : "Codex 执行失败。");
 }
 
-function desktopTerminalRunEvent(threadID, status, summary, sessionHint, detailSnapshot, evidence = 0) {
+function desktopTerminalRunEvent(threadID, status, summary, sessionHint, detailSnapshot, terminalID = "") {
   return {
     // Deterministic per settled run: the gateway deduplicates on the payload
     // event_id, so a re-emission after a plugin restart must keep this stable.
-    ID: `desktop-run:${threadID}:${status}:${evidence}`,
+    ID: `codex-task:${threadID}:${terminalID}:${status}`,
     Type: `run.${status}`,
     Status: status,
     Summary: summary,
@@ -6062,7 +6071,11 @@ async function emitDesktopTerminalRunEvents(threadID, status, detailSnapshot, se
   if (requireFresh && !desktopTerminalFreshEnough(evidenceInfo.mtimeMs)) {
     return;
   }
-  const normalized = desktopTerminalTransition(threadID, status, evidenceInfo.size);
+  const terminal = summarizeRolloutChunk(evidenceInfo.path);
+  if (!terminal.terminal || !terminal.terminalID) return;
+  const nativeStatus = terminal.failed ? "failed" : terminal.interrupted ? "interrupted" : "completed";
+  if (nativeStatus !== status) return;
+  const normalized = desktopTerminalTransition(threadID, nativeStatus, terminal.terminalID, terminal.terminalAt);
   if (!normalized) return;
   persistDesktopTerminalRuns();
   desktopRunFileWatchStop(threadID);
@@ -6079,7 +6092,7 @@ async function emitDesktopTerminalRunEvents(threadID, status, detailSnapshot, se
     desktopTerminalRunSummary(normalized, runSummary, latestSummary),
     sessionHint,
     detailSnapshot,
-    evidenceInfo.size,
+    terminal.terminalID,
   );
   for (const subscriber of desktopTerminalRunReceivers(threadID)) {
     emitDesktopWatchEvent(subscriber, event);
@@ -6786,9 +6799,11 @@ async function interrupt(session) {
   if (!isThreadID(threadID)) {
     throw new Error("control_target_stale: interrupt requires a resolved Codex thread id");
   }
-  const controller = await codexDesktopController();
-  await selectRequiredCodexThread(controller, threadID);
-  await controller.interrupt();
+  return runExclusiveDesktopControl(async () => {
+    const controller = await codexDesktopController();
+    await selectRequiredCodexThread(controller, threadID);
+    await controller.interrupt();
+  });
 }
 
 async function verifyVisibility(session, marker) {
@@ -6853,8 +6868,10 @@ async function waitForRun(session, runID) {
       const summary = result.summary
         || (result.failed ? "Codex 自动化执行失败。" : result.interrupted ? "Codex 任务已被打断。" : "Codex 已完成。");
       const detailSnapshot = await terminalDetailSnapshot(threadID).catch(() => null);
+      desktopTerminalTransition(threadID, status, result.terminalID, result.terminalAt);
+      persistDesktopTerminalRuns();
       return {
-        ID: String(runID || randomID()),
+        ID: result.terminalID ? `codex-task:${threadID}:${result.terminalID}:${status}` : String(runID || randomID()),
         Type: result.failed ? "run.failed" : result.interrupted ? "run.interrupted" : "run.completed",
         Status: status,
         Summary: summary,

@@ -45,3 +45,51 @@ test("slider facts expression reads the live-region announcement shape", () => {
   assert.match(source, /data-selected-reasoning-effort/);
   assert.match(source, /第\\s\*\\d\+\\s\*项/);
 });
+
+function nativeSliderFacts({ selectedID, announcement = '' }) {
+  const vm = require('node:vm');
+  const selections = [
+    { id: 'model:low', model: 'model', modelLabel: 'Model', reasoningEffort: 'low' },
+    { id: 'model:high', model: 'model', modelLabel: 'Model', reasoningEffort: 'high' },
+    { id: 'model:ultra', model: 'model', modelLabel: 'Model', reasoningEffort: 'ultra', isLocked: true },
+  ];
+  const row = {
+    getBoundingClientRect: () => ({ width: 200, height: 40 }),
+    focus() {},
+    __reactFiber$test: { memoizedProps: {
+      powerSelections: selections,
+      selectedPowerSelection: { id: selectedID },
+    } },
+  };
+  return vm.runInNewContext(__test.reasoningSliderFactsExpression(), {
+    document: { querySelectorAll(selector) {
+      if (selector === '[data-reasoning-slider="true"]') return [row];
+      if (selector === '[role="status"]') return [{ textContent: announcement }];
+      return [];
+    } },
+  });
+}
+
+test('native effort selection works without localized announcements', () => {
+  const facts = nativeSliderFacts({ selectedID: 'model:high' });
+  assert.equal(facts.index, 1);
+  assert.equal(facts.total, 3);
+  const rows = reasoningEffortRowsFromFacts(facts);
+  assert.equal(rows[1].checked, true);
+  assert.equal(rows[2].label, 'ultra');
+  assert.equal(rows[2].disabled, true);
+});
+
+test('native effort identity overrides stale or differently localized live regions', () => {
+  for (const announcement of ['Model Low, item 1 of 3', 'Model 轻度，第 1 项，共 3 项']) {
+    const facts = nativeSliderFacts({ selectedID: 'model:high', announcement });
+    assert.equal(facts.index, 1);
+    assert.equal(facts.total, 3);
+  }
+});
+
+test('unknown native effort identity does not invent a current selection', () => {
+  const facts = nativeSliderFacts({ selectedID: 'removed:high', announcement: 'Model 轻度，第 1 项，共 3 项' });
+  assert.equal(facts.index, -1);
+  assert.deepEqual(reasoningEffortRowsFromFacts(facts), []);
+});

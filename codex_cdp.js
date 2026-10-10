@@ -87,16 +87,19 @@ function goalPlanDOMHelpersSource() {
       const composerRoot = ${visibleDesktopElementExpression('[data-codex-composer-root]')};
       if (!card) return { status: 'none', objective: '', available: Boolean(prismVisible(composerRoot)) };
       const paused = Boolean(prismGoalControl('resume'));
-      // Current Codex renders the goal summary as its own button in the card:
-      // status / objective / elapsed-time. It is not a div, and a slash-command
-      // row never has the edit-and-clear card ownership checked above.
-      const summaryButtons = [...card.querySelectorAll('button')].filter((button) => {
+      // Newer Goal cards wrap status/objective/timer in a div next to the
+      // icon; older cards put those three spans directly inside the button.
+      const summaryGroups = [...card.querySelectorAll('button')].filter(prismVisible).map((button) => {
         const directSpans = [...button.children].filter((child) => child.tagName === 'SPAN');
-        return prismVisible(button) && directSpans.length === 3;
-      });
-      const spans = summaryButtons.length === 1
-        ? [...summaryButtons[0].children].filter((child) => child.tagName === 'SPAN')
-        : [];
+        if (directSpans.length === 3) return directSpans;
+        if (directSpans.length === 4 && prismHasIcon(button, ${JSON.stringify(GOAL_ICON_PREFIX)})) return directSpans.slice(-3);
+        if (!prismHasIcon(button, ${JSON.stringify(GOAL_ICON_PREFIX)})) return null;
+        const wrappers = [...button.children].filter((child) => child.tagName === 'DIV');
+        const groups = wrappers.map((wrapper) => [...wrapper.children].filter((child) => child.tagName === 'SPAN'))
+          .filter((spans) => spans.length === 3);
+        return groups.length === 1 ? groups[0] : null;
+      }).filter(Boolean);
+      const spans = summaryGroups.length === 1 ? summaryGroups[0] : [];
       // The goal row is structurally status / objective / elapsed-time. Read
       // the middle value so neither translated status nor the timer leaks into
       // the objective projected to Prism clients.
@@ -127,7 +130,7 @@ function goalPlanDOMHelpersSource() {
       const candidates = [...composerRoot.querySelectorAll('button')]
         .filter(prismVisible)
         .filter((button) => !button.closest('[data-list-navigation-item="true"], [role="menu"], [role="listbox"]'))
-        .filter((button) => prismHasIcon(button, ${JSON.stringify(PLAN_ICON_PREFIX)}));
+        .filter((button) => prismHasIcon(button, ${JSON.stringify(PLAN_ICON_PREFIX)}) || prismHasIcon(button, 'M8 3.80762'));
       return candidates.length === 1 ? candidates[0] : null;
     };
     const prismGoalPlanState = () => ({
@@ -269,7 +272,7 @@ function composerPrimaryActionElementExpression() {
       return key ? element[key] : null;
     };
     const hasComposerPrimaryButtonContract = (element) => {
-      for (let current = fiberFor(element), depth = 0; current && depth < 16; current = current.return, depth += 1) {
+      for (let current = fiberFor(element), depth = 0; current && depth < 64; current = current.return, depth += 1) {
         const props = current.memoizedProps;
         if (
           props && typeof props === 'object'
@@ -285,7 +288,7 @@ function composerPrimaryActionElementExpression() {
     const isComposerPrimaryAction = (element) => {
       if (!hasComposerPrimaryButtonContract(element)) return false;
       let ownerCount = 0;
-      for (let current = fiberFor(element), depth = 0; current && depth < 16; current = current.return, depth += 1) {
+      for (let current = fiberFor(element), depth = 0; current && depth < 64; current = current.return, depth += 1) {
         const props = current.memoizedProps;
         if (
           props && typeof props === 'object'
@@ -383,7 +386,7 @@ function composerPrimaryActionFactsSource() {
         return key ? element[key] : null;
       };
       const hasComposerPrimaryButtonContract = (element) => {
-        for (let current = fiberFor(element), depth = 0; current && depth < 16; current = current.return, depth += 1) {
+        for (let current = fiberFor(element), depth = 0; current && depth < 64; current = current.return, depth += 1) {
           const props = current.memoizedProps;
           if (
             props && typeof props === 'object'
@@ -426,6 +429,9 @@ function composerPrimaryActionFactsSource() {
         .filter(visible)
         .filter((element) => !element.hasAttribute('data-composer-navigation-target'))
         .filter((element) => String(element.getAttribute('aria-haspopup') || '').toLowerCase() !== 'menu');
+      // Desktop layouts can put the submit state owner beyond 16 Fiber ancestors.
+      // Use a bounded 64-level search and keep the exact owner/primary-button
+      // contracts and unique candidate checks, including when dictation is present.
       // Other composer actions (for example dictation) can be siblings of the
       // actual submit button. Select only the button whose Fiber ancestry owns
       // the complete submit state and the primary-button contract; visible
@@ -434,7 +440,7 @@ function composerPrimaryActionFactsSource() {
       for (const element of candidates) {
         if (!hasComposerPrimaryButtonContract(element)) continue;
         const owners = [];
-        for (let current = fiberFor(element), depth = 0; current && depth < 16; current = current.return, depth += 1) {
+        for (let current = fiberFor(element), depth = 0; current && depth < 64; current = current.return, depth += 1) {
           const props = current.memoizedProps;
           if (!props || typeof props !== 'object') continue;
           if (
@@ -482,26 +488,10 @@ function composerStopClickExpression() {
     if (!facts || facts.usable !== true || facts.enabled !== true || facts.response_in_progress !== true || facts.mode !== 'stop') {
       return { ok: false, reason: 'interrupt_control_unavailable' };
     }
-    const visible = (element) => {
-      const rect = element && element.getBoundingClientRect();
-      return Boolean(rect && rect.width > 0 && rect.height > 0);
-    };
-    const composer = ${composerContainerElementExpression()};
-    let footer = null;
-    for (let node = composer; node; node = node.parentElement) {
-      if ([...node.querySelectorAll('[data-composer-navigation-target]')].some(visible)) {
-        footer = node;
-        break;
-      }
-    }
-    if (!footer) return { ok: false, reason: 'interrupt_control_unavailable' };
-    const actions = [...footer.querySelectorAll('button, [role="button"]')]
-      .filter(visible)
-      .filter((element) => !element.hasAttribute('data-composer-navigation-target'))
-      .filter((element) => String(element.getAttribute('aria-haspopup') || '').toLowerCase() !== 'menu')
-      .filter((element) => !element.disabled && element.getAttribute('aria-disabled') !== 'true');
-    if (actions.length !== 1) return { ok: false, reason: 'interrupt_control_unavailable' };
-    const action = actions[0];
+    // Dictation and other utility buttons share this footer. Resolve the
+    // primary action by its native Composer contract, just as send does.
+    const action = ${composerPrimaryActionElementExpression()};
+    if (!action) return { ok: false, reason: 'interrupt_control_unavailable' };
     action.focus && action.focus();
     const pointer = { bubbles: true, cancelable: true, pointerId: 1, pointerType: 'mouse', button: 0, buttons: 1 };
     const down = { bubbles: true, cancelable: true, button: 0, buttons: 1 };
@@ -682,7 +672,7 @@ function queueDOMHelpersSource() {
       return null;
     };
     const queueItemCarriers = () => {
-      const footer = document.querySelector('[data-thread-scroll-footer="true"]');
+      const footer = ${visibleDesktopElementExpression('[data-thread-scroll-footer="true"]')};
       if (!footer || !queueVisible(footer)) return [];
       return [...footer.querySelectorAll('p')]
         .filter(queueVisible)
@@ -904,7 +894,7 @@ function queueDOMHelpersSource() {
     const queueLevelActionElements = () => {
       const items = queueItemEntries();
       if (!items.length) return [];
-      const footer = document.querySelector('[data-thread-scroll-footer="true"]');
+      const footer = ${visibleDesktopElementExpression('[data-thread-scroll-footer="true"]')};
       if (!footer || !queueVisible(footer)) return [];
       return [...footer.querySelectorAll('button, [role="button"]')]
         .filter(queueVisible)
@@ -1167,10 +1157,17 @@ function reasoningSliderFactsExpression() {
     const prefixParts = match ? match[1].trim().split(/\\s+/).filter(Boolean) : [];
     const trigger = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
     let selections = [];
+    let selectedIndex = -1;
+    let hasNativeSelection = false;
     let fiber = row[Object.keys(row).find((key) => key.startsWith('__reactFiber$'))];
     for (let depth = 0; fiber && depth < 24; depth += 1, fiber = fiber.return) {
       const props = fiber.memoizedProps;
       if (!Array.isArray(props && props.powerSelections)) continue;
+      // The native selection identity works across locales and does not
+      // depend on asynchronous accessibility announcements.
+      const selectedID = props.selectedPowerSelection && props.selectedPowerSelection.id;
+      hasNativeSelection = selectedID != null;
+      selectedIndex = selectedID == null ? -1 : props.powerSelections.findIndex((selection) => selection.id === selectedID);
       selections = props.powerSelections.map((selection) => ({
         id: String(selection.id || ''),
         model: String(selection.model || ''),
@@ -1182,8 +1179,8 @@ function reasoningSliderFactsExpression() {
     }
     return {
       selections,
-      index: match ? Math.max(0, Number(match[2]) - 1) : -1,
-      total: match ? Math.max(0, Number(match[3])) : 0,
+      index: hasNativeSelection ? selectedIndex : match ? Math.max(0, Number(match[2]) - 1) : -1,
+      total: selections.length || (match ? Math.max(0, Number(match[3])) : 0),
       label: prefixParts.length > 1 ? prefixParts[prefixParts.length - 1] : '',
       announcement,
       effortValue: trigger ? String(trigger.getAttribute('data-selected-reasoning-effort') || '').trim() : '',
@@ -1193,8 +1190,7 @@ function reasoningSliderFactsExpression() {
 
 const EFFORT_CONTROL_ID = "codex.intelligence.effort";
 
-// Facts come from the slider live region; only the current level carries a
-// localized name, so every other level is addressed by its 1-based ordinal.
+// Prefer native power selections, with live-region facts for older Desktop builds.
 function reasoningEffortRowsFromFacts(facts) {
   if (!facts || typeof facts !== "object") return [];
   const total = Number(facts.total) || 0;
@@ -2063,9 +2059,9 @@ class CodexDesktopController extends CdpPageClient {
   async waitForReady() {
     await this.waitFor(
       // The sidebar is optional in current compact Desktop layouts. The
-      // foreground thread carrier or a mounted Composer is the authoritative
-      // readiness surface and remains available when the sidebar is hidden.
-      "Boolean(document.querySelector('[data-above-composer-conversation-id]') || document.querySelector('[data-codex-composer-root], [data-codex-composer=\"true\"], [data-codex-composer]'))",
+      // visible Composer is the readiness surface for bound threads and
+      // drafts; retained hidden conversation trees must not report ready.
+      `Boolean(${composerContainerElementExpression()})`,
       this.options.readyTimeoutMs || DEFAULT_READY_TIMEOUT_MS,
     );
   }
@@ -2181,6 +2177,7 @@ class CodexDesktopController extends CdpPageClient {
     // Do not include composer content in the failure. These facts make a
     // timeout actionable while keeping user text out of Hub/API diagnostics.
     const diagnostic = lastFacts ? {
+      reason: String(lastFacts.reason || ""),
       usable: lastFacts.usable === true,
       enabled: lastFacts.enabled === true,
       mode: String(lastFacts.mode || ""),
@@ -2263,7 +2260,7 @@ class CodexDesktopController extends CdpPageClient {
         const textOf = (el) => (el ? (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim() : '');
         const composer = ${composerContainerElementExpression()};
         const composerText = textOf(composer);
-        const attachmentRow = document.querySelector('[data-composer-attachments-row="true"]');
+        const attachmentRow = ${visibleDesktopElementExpression('[data-composer-attachments-row="true"]')};
         const attachments = attachmentRow ? attachmentRow.querySelectorAll('[role="button"][aria-label]').length : 0;
         return {
           composerText,
@@ -2295,10 +2292,28 @@ class CodexDesktopController extends CdpPageClient {
     const attachment = {
       name: firstNonEmpty(fileName, path.basename(resolvedPath)),
       mimeType: firstNonEmpty(mimeType, "application/octet-stream"),
-      base64: fs.readFileSync(resolvedPath).toString("base64"),
     };
     await this.focusComposer();
-    const injection = await this.evaluate(`(async () => {
+    // Browser-created Files lose Electron's native filesystem backing. Even
+    // adding File.path does not help getPathForFile(), so image handlers fall
+    // back to data URIs which local Codex turns cannot open as image paths.
+    // CDP's file-input transport creates a real disk-backed File. The hidden
+    // input is temporary transport only; native Composer handlers own the UI.
+    const inputID = `prism-attachment-${crypto.randomUUID()}`;
+    let injection;
+    try {
+      await this.evaluate(`(() => {
+        const input = document.createElement('input');
+        input.id = ${JSON.stringify(inputID)};
+        input.type = 'file';
+        input.hidden = true;
+        document.body.appendChild(input);
+      })()`);
+      const dom = await this.send('DOM.getDocument', {});
+      const target = await this.send('DOM.querySelector', { nodeId: dom.root.nodeId, selector: `#${inputID}` });
+      if (!target.nodeId) throw new Error('native_attachment_file_transport_unavailable');
+      await this.send('DOM.setFileInputFiles', { nodeId: target.nodeId, files: [resolvedPath] });
+      injection = await this.evaluate(`(async () => {
       const composer = ${composerContainerElementExpression()};
       if (!composer) return { ok: false, reason: 'composer_missing' };
       const fiberFor = (element) => {
@@ -2316,38 +2331,48 @@ class CodexDesktopController extends CdpPageClient {
         }
       }
       if (!composerController) return { ok: false, reason: 'composer_controller_unavailable' };
-      const bytes = Uint8Array.from(atob(${JSON.stringify(attachment.base64)}), c => c.charCodeAt(0));
-      const file = new File([bytes], ${JSON.stringify(attachment.name)}, { type: ${JSON.stringify(attachment.mimeType)} });
-      // The Desktop's native paste/file handlers receive Electron Files. A
-      // browser-created File lacks its filesystem path and is silently
-      // ignored by the generic-file handler, so retain the Hub materialized
-      // path as a non-enumerable File property before dispatching it.
+      const file = document.getElementById(${JSON.stringify(inputID)})?.files?.[0];
+      if (!file) return { ok: false, reason: 'native_attachment_file_transport_empty' };
+      // Keep the display name while preserving the browser's disk backing.
+      // Generic upload MIME metadata must not override an inferred image MIME.
+      Object.defineProperty(file, 'name', { value: ${JSON.stringify(attachment.name)}, configurable: true });
+      const requestedMIME = ${JSON.stringify(attachment.mimeType)};
+      if (requestedMIME !== 'application/octet-stream' || !file.type) {
+        Object.defineProperty(file, 'type', { value: requestedMIME, configurable: true });
+      }
       Object.defineProperty(file, 'path', { value: ${JSON.stringify(resolvedPath)}, configurable: true });
-      // Codex's image-paste handler serializes a browser-created File as a
-      // data URI. That can exceed the agent's path handling limits. The native
-      // generic file handler retains File.path for both images and documents,
-      // while Codex still renders an image attachment card for image MIME types.
       const handlers = composerController.pastedFilesHandlers;
       if (!(handlers instanceof Map) || handlers.size === 0) {
         return { ok: false, reason: 'native_attachment_handler_unavailable' };
       }
-      // Codex registers these handlers on ComposerController, rather than as
-      // a DOM paste listener. Its native contract is a File[] payload.
+      // Legacy handlers accept File[]; current registered wrappers destructure
+      // { files, dataTransfer }. Supply both contracts in one invocation rather
+      // than retrying a handler and potentially inserting the same file twice.
+      const files = [file];
+      const dataTransfer = new DataTransfer();
+      dataTransfer.items.add(file);
+      Object.defineProperties(files, {
+        files: { value: files },
+        dataTransfer: { value: dataTransfer },
+      });
       let invoked = 0;
       for (const handler of handlers.values()) {
         if (typeof handler !== 'function') continue;
         try {
-          await Promise.resolve(handler([file]));
+          await Promise.resolve(handler(files));
           invoked += 1;
         } catch (error) {
           return { ok: false, reason: 'native_attachment_handler_failed', handler_count: invoked, detail: String(error && error.message || error || '').slice(0, 240) };
         }
       }
       return invoked > 0 ? { ok: true, handler_count: invoked } : { ok: false, reason: 'native_attachment_handler_unavailable' };
-    })()`);
+      })()`);
+    } finally {
+      await this.evaluate(`document.getElementById(${JSON.stringify(inputID)})?.remove()`).catch(() => {});
+    }
     if (!injection || injection.ok !== true) {
       const reason = firstNonEmpty(injection && injection.reason, "native_attachment_injection_failed");
-      throw new Error(`Codex CDP attachment injection unavailable: ${reason}`);
+      throw new Error(`Codex CDP attachment injection unavailable: ${reason}${injection?.detail ? ` (${String(injection.detail).slice(0, 240)})` : ""}`);
     }
     const attachmentStateExpression = `(() => {
       ${composerAttachmentStateSource()}
@@ -2562,11 +2587,28 @@ class CodexDesktopController extends CdpPageClient {
       const visible = (element) => { const rect = element && element.getBoundingClientRect(); return Boolean(rect && rect.width > 0 && rect.height > 0); };
       const rows = [...document.querySelectorAll('button[data-list-navigation-item=true]')]
         .filter(visible)
-        .filter((button) => String(button.querySelector('svg path')?.getAttribute('d') || '').startsWith(${JSON.stringify(prefix)}));
+        .filter((button) => {
+          const commandKey = ${JSON.stringify(prefix === PLAN_ICON_PREFIX ? 'plan-mode' : prefix === GOAL_ICON_PREFIX ? 'goal' : '')};
+          let fiber = button[Object.keys(button).find((key) => key.startsWith('__reactFiber$'))];
+          for (let depth = 0; fiber && depth < 4; depth += 1, fiber = fiber.return) {
+            if (commandKey && fiber.key === commandKey) return true;
+          }
+          return String(button.querySelector('svg path')?.getAttribute('d') || '').startsWith(${JSON.stringify(prefix)});
+        });
       return rows.length === 1 ? rows[0] : null;
     })()`;
-    await this.waitFor(`Boolean(${expression})`, this.options.actionTimeoutMs || DEFAULT_ACTION_TIMEOUT_MS, 80);
+    await this.waitForControl(`Boolean(${expression})`, "slash command row");
     await this.dispatchDomPointerClick(expression);
+  }
+
+  async waitForControl(expression, phase) {
+    try {
+      await this.waitFor(expression, this.options.actionTimeoutMs || DEFAULT_ACTION_TIMEOUT_MS, 80);
+    } catch (error) {
+      // Reconcile a late native state once, without repeating a mutating click.
+      if (await this.evaluate(expression).catch(() => false)) return;
+      throw new Error(`control_target_stale: ${phase} did not settle: ${error.message}`, { cause: error });
+    }
   }
 
   async setPlanMode(enabled) {
@@ -2588,7 +2630,7 @@ class CodexDesktopController extends CdpPageClient {
         throw new Error("control_target_stale: active plan toggle is unavailable");
       }
       await this.dispatchDomPointerClick(indicator);
-      await this.waitFor(`(() => { ${goalPlanDOMHelpersSource()} return prismGoalPlanState().plan_mode.enabled === false; })()`, this.options.actionTimeoutMs || DEFAULT_ACTION_TIMEOUT_MS, 80);
+      await this.waitForControl(`(() => { ${goalPlanDOMHelpersSource()} return prismGoalPlanState().plan_mode.enabled === false; })()`, "plan.disable");
       return (await this.goalPlanState()).plan_mode;
     }
     const draft = String(await this.evaluate(`(() => {
@@ -2597,7 +2639,7 @@ class CodexDesktopController extends CdpPageClient {
     })()`) || "");
     try {
       await this.openSlashCommand(PLAN_ICON_PREFIX);
-      await this.waitFor(`(() => { ${goalPlanDOMHelpersSource()} return prismGoalPlanState().plan_mode.enabled === ${JSON.stringify(desired)}; })()`, this.options.actionTimeoutMs || DEFAULT_ACTION_TIMEOUT_MS, 80);
+      await this.waitForControl(`(() => { ${goalPlanDOMHelpersSource()} return prismGoalPlanState().plan_mode.enabled === ${JSON.stringify(desired)}; })()`, "plan.enable");
     } finally {
       await this.setComposerText(draft).catch(() => {});
     }
@@ -2624,9 +2666,9 @@ class CodexDesktopController extends CdpPageClient {
       await this.openSlashCommand(GOAL_ICON_PREFIX);
       await this.setComposerText(value);
       const submit = goalComposerSubmitElementExpression();
-      await this.waitFor(`Boolean(${submit})`, this.options.actionTimeoutMs || DEFAULT_ACTION_TIMEOUT_MS, 80);
-      await this.clickElement(submit);
-      await this.waitFor(`(() => { ${goalPlanDOMHelpersSource()} const goal = prismGoalState(); return goal.status !== 'none' && goal.objective === ${JSON.stringify(value)}; })()`, this.options.actionTimeoutMs || DEFAULT_ACTION_TIMEOUT_MS, 80);
+      await this.waitForControl(`Boolean(${submit})`, "goal.submit ready");
+      await this.dispatchDomPointerClick(submit);
+      await this.waitForControl(`(() => { ${goalPlanDOMHelpersSource()} const goal = prismGoalState(); return goal.status !== 'none' && goal.objective === ${JSON.stringify(value)}; })()`, "goal.set postcondition");
     } finally {
       await this.setComposerText(draft).catch(() => {});
     }
@@ -2655,8 +2697,20 @@ class CodexDesktopController extends CdpPageClient {
     }
     await this.dispatchDomPointerClick(`(() => { ${goalPlanDOMHelpersSource()} return prismGoalControl(${JSON.stringify(kind)}); })()`);
     const desired = kind === "pause" ? "paused" : kind === "resume" ? "running" : "none";
-    await this.waitFor(`(() => { ${goalPlanDOMHelpersSource()} return prismGoalState().status === ${JSON.stringify(desired)}; })()`, this.options.actionTimeoutMs || DEFAULT_ACTION_TIMEOUT_MS, 80);
-    return (await this.goalPlanState()).goal;
+    // Goal transitions briefly unmount the card and its lifecycle controls.
+    // Return the confirmed snapshot itself, not a second read during animation.
+    const deadline = Date.now() + (this.options.actionTimeoutMs || DEFAULT_ACTION_TIMEOUT_MS);
+    let confirmed = 0;
+    do {
+      const goal = (await this.goalPlanState()).goal;
+      const settled = goal && goal.status === desired && (
+        desired === 'none' || (goal.actions && goal.actions[desired === 'paused' ? 'resume' : 'pause'] === true)
+      );
+      confirmed = settled ? confirmed + 1 : 0;
+      if (confirmed >= 3) return goal;
+      await sleep(80);
+    } while (Date.now() < deadline);
+    throw new Error('control_target_stale: goal did not reach the requested state');
   }
 
   async queuedMessageState() {
@@ -3220,9 +3274,8 @@ class CodexDesktopController extends CdpPageClient {
   }
 
   // Reasoning effort lives in a native slider row inside the intelligence
-  // menu. Levels are addressed by their zero-based announcement index. The
-  // localized level name is only knowable for the current level, so other
-  // rows carry an ordinal label and the panel renders them positionally.
+  // menu. Native power selections provide the real effort names and lock
+  // state; older Desktop builds fall back to the accessibility announcement.
   async readReasoningEffortFacts() {
     return this.evaluate(reasoningSliderFactsExpression());
   }

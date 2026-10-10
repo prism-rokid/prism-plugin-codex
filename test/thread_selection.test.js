@@ -215,7 +215,15 @@ test("workspace readiness supports bound conversations and anonymous drafts", as
 
   await controller.waitForReady();
 
-  assert.match(readinessScript, /data-above-composer-conversation-id/);
+  const vm = require("node:vm");
+  const hidden = { getBoundingClientRect: () => ({ width: 0, height: 0 }) };
+  const visible = { getBoundingClientRect: () => ({ width: 500, height: 100 }) };
+  for (const composer of [visible, hidden]) {
+    const ready = vm.runInNewContext(readinessScript, {
+      document: { querySelectorAll: () => [hidden, composer] },
+    });
+    assert.equal(ready, composer === visible);
+  }
   assert.doesNotMatch(readinessScript, /data-app-action-sidebar-thread-row/);
   assert.match(readinessScript, /data-codex-composer/);
 });
@@ -541,7 +549,7 @@ test("Composer and menu controls skip retained hidden duplicates", () => {
   const vm = require("node:vm");
   const hidden = { getBoundingClientRect: () => ({ width: 0, height: 0 }) };
   const visible = { getBoundingClientRect: () => ({ width: 800, height: 100 }) };
-  for (const selector of ["[data-codex-composer-root]", '[data-codex-intelligence-trigger="true"]', '[data-composer-navigation-target="permissions"]']) {
+  for (const selector of ['[data-thread-scroll-footer="true"]', '[data-composer-attachments-row="true"]', "[data-codex-composer-root]", '[data-codex-intelligence-trigger="true"]', '[data-composer-navigation-target="permissions"]']) {
     const context = { document: { querySelectorAll: (requested) => {
       assert.equal(requested, selector);
       return [hidden, visible];
@@ -577,4 +585,39 @@ test("reasoning options use native efforts and lock state rather than ordinal pl
   ] });
   assert.deepEqual(rows.map(row => row.label), ["low", "high", "ultra"]);
   assert.deepEqual(rows.map(row => row.disabled), [false, false, true]);
+});
+
+test("interrupt clicks only the native Stop action when dictation shares the footer", async () => {
+  const vm = require("node:vm");
+  const events = [];
+  const element = (name, navigation = false) => ({
+    getBoundingClientRect: () => ({ width: 20, height: 20 }),
+    getAttribute: () => null,
+    hasAttribute: (key) => navigation && key === "data-composer-navigation-target",
+    matches: () => true,
+    querySelectorAll: () => [],
+    focus: () => {},
+    dispatchEvent: (event) => { events.push([name, event.type]); },
+  });
+  const stop = element("stop");
+  stop.__reactFiber$fixture = { memoizedProps: {
+    isLoading: false, disabled: false, ariaLabel: "Stop", Icon: {}, onClick: () => {},
+    submitButtonMode: "stop", isResponseInProgress: true, isQueueingEnabled: true, submitDisabled: false,
+  } };
+  const dictation = element("dictation");
+  const permission = element("permission", true);
+  const composer = element("composer");
+  composer.querySelectorAll = (selector) => selector === "[data-composer-navigation-target]"
+    ? [permission] : selector === 'button, [role="button"]' ? [dictation, permission, stop] : [];
+  const controller = Object.create(CodexDesktopController.prototype);
+  controller.ensureReady = async () => {};
+  controller.evaluate = async (source) => vm.runInNewContext(source, {
+    document: { querySelectorAll: (selector) => selector === ".composer-attachment-surface" ? [] : [composer] },
+    MouseEvent: class { constructor(type) { this.type = type; } },
+    PointerEvent: class { constructor(type) { this.type = type; } },
+  });
+  await controller.interrupt();
+  assert.equal(events.length, 5);
+  assert.ok(events.every(([name]) => name === "stop"));
+  assert.equal(events.at(-1)[1], "click");
 });

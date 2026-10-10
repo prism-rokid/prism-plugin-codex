@@ -15,21 +15,21 @@ const {
 
 const THREAD_ID = "0af83a58-7e21-4c11-9e64-8ff45b6e91a2";
 
-test("terminal dedup keys on rollout evidence: more content is a new run, UI lag never re-arms", () => {
-  assert.equal(desktopTerminalTransition(THREAD_ID, "completed", 100), "completed");
+test("terminal dedup keys on native tasks, never on appended metadata or UI lag", () => {
+  assert.equal(desktopTerminalTransition(THREAD_ID, "completed", "turn-one"), "completed");
   // recorded_terminal 残留：同一证据的重复终态不重发
-  assert.equal(desktopTerminalTransition(THREAD_ID, "completed", 100), null);
+  assert.equal(desktopTerminalTransition(THREAD_ID, "completed", "turn-one"), null);
   // UI 状态滞后（文件已终态、页面还在 running）不得解除武装，也不得重发
   assert.equal(desktopTerminalTransition(THREAD_ID, "running"), null);
-  assert.equal(desktopTerminalTransition(THREAD_ID, "completed", 100), null);
-  // 追问新一轮：rollout 追加了更多内容 → 新终态
-  assert.equal(desktopTerminalTransition(THREAD_ID, "completed", 260), "completed");
-  // 状态变化（completed → failed）总是新终态
-  assert.equal(desktopTerminalTransition(THREAD_ID, "failed", 300), "failed");
-  assert.equal(desktopTerminalTransition(THREAD_ID, "failed", 300), null);
-  // 无证据时按时间窗兜底：10s 内同状态不重发
+  assert.equal(desktopTerminalTransition(THREAD_ID, "completed", "turn-one"), null);
+  // 追问新一轮：新的 native turn ID → 新终态
+  assert.equal(desktopTerminalTransition(THREAD_ID, "completed", "turn-two"), "completed");
+  // 另一个 native task 失败 → 新终态
+  assert.equal(desktopTerminalTransition(THREAD_ID, "failed", "turn-three"), "failed");
+  assert.equal(desktopTerminalTransition(THREAD_ID, "failed", "turn-three"), null);
+  // 缺少 native task 身份时不推测新终态
   assert.equal(desktopTerminalTransition(THREAD_ID, "idle"), null);
-  assert.equal(desktopTerminalTransition(THREAD_ID, "interrupted", 0), "interrupted");
+  assert.equal(desktopTerminalTransition(THREAD_ID, "interrupted", ""), null);
   assert.equal(desktopTerminalTransition(THREAD_ID, ""), null);
 });
 
@@ -43,7 +43,7 @@ test("terminal run summary prefers rollout text for completed and error text for
 
 test("terminal run event carries routing payload for the hub conversation forward", () => {
   const hint = { plugin_id: "codex", native_thread_id: THREAD_ID, cwd: "/tmp/proj" };
-  const event = desktopTerminalRunEvent(THREAD_ID, "failed", "执行出错：超时", hint, { run: { status: "failed" } });
+  const event = desktopTerminalRunEvent(THREAD_ID, "failed", "执行出错：超时", hint, { run: { status: "failed" } }, "turn-failed");
 
   assert.equal(event.Type, "run.failed");
   assert.equal(event.Status, "failed");
@@ -52,9 +52,9 @@ test("terminal run event carries routing payload for the hub conversation forwar
   assert.equal(event.Payload.native_session.native_thread_id, THREAD_ID);
   assert.equal(event.Payload.native_session.surface, "codex-desktop");
   assert.equal(event.Payload.session_hint.cwd, "/tmp/proj");
-  assert.deepEqual(event.Payload.detail_snapshot, { run: { status: "failed" } });
+  assert.deepEqual(event.Payload.detail_snapshot, { run: { status: "failed" } }, "turn-failed");
   // 确定性 ID：同一次结算重发必须保持稳定，gateway 依赖它去重
-  assert.equal(event.ID, `desktop-run:${THREAD_ID}:failed:0`);
+  assert.equal(event.ID, `codex-task:${THREAD_ID}:turn-failed:failed`);
 });
 
 test("terminal run events reach plugin-wide watchers and matching threads only", () => {

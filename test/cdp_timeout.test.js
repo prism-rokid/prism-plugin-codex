@@ -473,7 +473,7 @@ test("native attachment injection uses ComposerController handlers without local
 
   assert.match(cdpSource, /composerController\.pastedFilesHandlers/);
   assert.doesNotMatch(cdpSource, /composerController\.pastedImagesHandlers/);
-  assert.match(cdpSource, /handler\(\[file\]\)/);
+  assert.match(cdpSource, /handler\(files\)/);
   assert.match(cdpSource, /function composerAttachmentStateSource/);
   assert.match(cdpSource, /prismComposerAttachmentState/);
   assert.match(cdpSource, /composer-attachment-surface/);
