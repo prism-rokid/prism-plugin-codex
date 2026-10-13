@@ -44,3 +44,28 @@ test("foreground detail context is derived from the rollout token event", () => 
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("historical thread metadata includes reasoning effort from the rollout turn context", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prism-codex-reasoning-"));
+  const rollout = path.join(dir, "rollout-2026-07-26T00-00-00-22222222-2222-4222-8222-222222222222.jsonl");
+  try {
+    fs.writeFileSync(rollout, `${JSON.stringify({
+      type: "turn_context",
+      payload: {
+        model: "gpt-5.6",
+        collaboration_mode: { settings: { reasoning_effort: "high" } },
+      },
+    })}\n`);
+
+    const thread = __test.withRolloutContextMetadata({
+      id: "22222222-2222-4222-8222-222222222222",
+      rolloutPath: rollout,
+      metadata: {},
+    });
+
+    assert.equal(thread.metadata.model, "gpt-5.6");
+    assert.equal(thread.metadata.reasoning_effort, "high");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

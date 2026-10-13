@@ -56,7 +56,7 @@ Control-path notes:
 - 桌面控制通过 CDP 执行；非侧栏可见线程允许使用宿主路由回退，并必须核对前台身份；不通过 app-server 或系统剪贴板执行会话写操作。
   - 例外：账号额度投影（`agent_usage`）是只读诊断通道，投影 5 小时（300 分钟）和每周（10080 分钟）两个窗口；仍走 App Server 的 `account/rateLimits/read`、`account/usage/read` 与 `account/rateLimits/updated`，不参与任何 thread 控制；可执行体按序解析桌面 app 内置二进制（`Contents/Resources/codex-cli/bin/codex`（2026-09 桌面版新布局）或旧布局 `Contents/Resources/codex`）以复用 `~/.codex/auth.json`，PATH/npm CLI `codex` 会因 `-32600 chatgpt authentication required` 失败
 - 模型 / 推理 / 权限优先走桌面 live 菜单索引点击，减少对中英文文案匹配的依赖
-- manifest 将 Desktop 的模型、推理、权限声明为 `runtime_controls.*=interactive`；组合 intelligence 控件携带 `semantic_kinds: [model, reasoning]`，权限控件携带 `[permission]`。Plugin 不再同时对外发布稳定 `current_*` 控件。
+- manifest 将 Desktop 的模型、推理、权限声明为 `runtime_controls.*=interactive`；组合 intelligence 控件携带 `semantic_kinds: [model, reasoning]`，权限控件携带 `[permission]`。Plugin 不再同时对外发布稳定 `current_*` 控件，也不发布 `codex.intelligence.effort` 这种内部 slider ID；它只能作为组合 intelligence 菜单内部的 CDP 执行路由。
 - manifest 将重命名、置顶、归档、删除声明为 `runtime_operations.*=menu`；这些操作只从当前真实 Header menu-session 暴露，不再与 direct `actions[]` 重复。
 - 附件通过当前 ComposerController 注册的文件处理器注入；同时兼容旧 File[] 与新 {files, dataTransfer} 包装契约，每个处理器仅调用一次；TXT/PNG 通过 CDP 文件输入传输取得真正由磁盘支持的 File，并保留本地路径；临时输入在调用结束后回收。
 - `/` 命令面板能力后续也必须按 CDP-only 原则补齐；在未验证桌面真实 UI 前，不把这些能力暴露成正式手机端操作。
@@ -70,3 +70,7 @@ Control-path notes:
 ### 0.1.33 桌面深层 Composer 状态修复
 
 桌面布局可将发送状态 owner 放到按钮第 26 层 Fiber 祖先；原 16 层查找会错误报告 `queue_unavailable`。现在发送、排队、引导、停止与运行态统一采用有界 64 层查找，继续校验完整按钮契约、唯一 owner 与当前可见输入框。超时诊断保留具体 `reason`，不包含用户正文。
+
+### 0.1.34 Header 菜单身份修复
+
+Header 菜单项可能共享相同的 React `onSelect` handler 源码。菜单行身份现结合 handler 指纹与 React key / DOM 稳定标识；菜单应用前仍重新读取并核对完整身份快照，无法区分的项目继续安全拒绝。组合模型与推理控件保持唯一公开 owner，`codex.intelligence.effort` 仅作为菜单会话内部滑杆路由。

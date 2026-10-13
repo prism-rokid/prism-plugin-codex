@@ -773,6 +773,7 @@ function queueDOMHelpersSource() {
       // Codex does not expose an action ID or semantic handler for these rows.
       // Treat the concrete vector identity as a version-scoped capability. An
       // unknown icon is deliberately not exposed to Mobile.
+      if (paths.length === 1 && paths[0].startsWith('M9.41506 2.54535C10.5566 1.516 12.2884 1.57105 13.3399 2.64105')) return 'edit_message';
       if (paths.length === 1 && paths[0].startsWith('M11.7313 4.20472C13.1489')) return 'edit_message';
       if (paths.length === 2 && paths[0].startsWith('M3.165 10c0-3.51') && paths[1].startsWith('M10 6.335A')) return 'desktop_side_chat';
       if (paths.length === 1 && paths[0].startsWith('M2.66797 11V3.33301')) return 'close_queue';
@@ -887,6 +888,9 @@ function queueDOMHelpersSource() {
             nested_remote_handler: Boolean([...el.querySelectorAll('*')].some((child) => queueActionHandlerSource(child))),
             published: Boolean(action),
             disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
+            icon_paths: [...el.querySelectorAll('svg path')]
+              .map((path) => String(path.getAttribute('d') || '').trim().slice(0, 96))
+              .filter(Boolean),
           };
         }),
       };
@@ -1395,6 +1399,15 @@ function sameConversationHeaderMenuRows(actual, expected) {
   });
 }
 
+function conversationHeaderEntryOptionID(handlerSource, stableTarget = {}) {
+  const payload = JSON.stringify([String(handlerSource || ''), stableTarget && typeof stableTarget === 'object' ? stableTarget : {}]);
+  let hash = 0xcbf29ce484222325n;
+  for (const char of payload) {
+    hash = BigInt.asUintN(64, (hash ^ BigInt(char.codePointAt(0))) * 0x100000001b3n);
+  }
+  return `conversation.header:${hash.toString(16).padStart(16, '0')}`;
+}
+
 function sameQueueMenuRows(actual, expected) {
   if (!Array.isArray(expected) || expected.length === 0) return true;
   if (!Array.isArray(actual) || actual.length !== expected.length) return false;
@@ -1421,6 +1434,26 @@ function conversationHeaderMenuHelpersSource() {
       const key = Object.keys(el || {}).find((name) => name.startsWith('__reactFiber$'));
       return key ? el[key] : null;
     };
+    const prismHeaderStableTarget = (el) => {
+      let reactKey = '';
+      for (let fiber = prismHeaderFiber(el), depth = 0; fiber && depth < 32; fiber = fiber.return, depth += 1) {
+        if (fiber.key !== null && fiber.key !== undefined && String(fiber.key).trim()) {
+          reactKey = String(fiber.key).trim();
+          break;
+        }
+      }
+      return {
+        id: String(el.id || ''),
+        testID: String(el.getAttribute('data-testid') || ''),
+        action: String(el.getAttribute('data-action') || ''),
+        href: String(el.getAttribute('href') || ''),
+        ariaKeyshortcuts: String(el.getAttribute('aria-keyshortcuts') || ''),
+        reactKey,
+      };
+    };
+    const prismHeaderRemoteSafe = (target) => new Set([
+      'rename-thread', 'pin-thread', 'archive-thread', 'unarchive-thread', 'delete-thread',
+    ]).has(String(target && target.reactKey || ''));
     const prismHeaderHandlerSource = (el) => {
       const sources = [];
       for (let fiber = prismHeaderFiber(el), depth = 0; fiber && depth < 24; fiber = fiber.return, depth += 1) {
@@ -1437,6 +1470,7 @@ function conversationHeaderMenuHelpersSource() {
       for (const char of String(value || '')) hash = BigInt.asUintN(64, (hash ^ BigInt(char.codePointAt(0))) * 0x100000001b3n);
       return hash.toString(16).padStart(16, '0');
     };
+    const prismHeaderEntryOptionID = ${conversationHeaderEntryOptionID.toString()};
     const prismHeaderDesktopOnly = (source) => /(?:openSideChat|open-in-new-window|thread-overflow|clipboard|open_in_browser_bridge|openExternal|window\\.open|location\\.(?:assign|replace|href)|showOpenDialog|showSaveDialog|dispatchHostMessage|startNewConversation|navigate|router\\.|history\\.(?:push|replace)|appPath|openMode:\\s*['\\x60]workspace)/i.test(source || '');
     const prismHeaderSurface = () => {
       const surfaces = [...document.querySelectorAll('[data-testid="app-shell-header-context-menu-surface"]')].filter(prismHeaderVisible);
@@ -1469,13 +1503,13 @@ function conversationHeaderMenuHelpersSource() {
       return [...menu.querySelectorAll('[role="menuitem"]')]
         .filter(prismHeaderVisible)
         .filter((el) => !el.hasAttribute('aria-haspopup'))
-        .map((el, index) => {
+        .map((el) => {
           const source = prismHeaderHandlerSource(el);
           const label = prismHeaderText(el);
-          if (!source || !label || prismHeaderDesktopOnly(source)) return null;
+          const stableTarget = prismHeaderStableTarget(el);
+          if (!source || !label || prismHeaderDesktopOnly(source) || !prismHeaderRemoteSafe(stableTarget)) return null;
           return {
-            index,
-            optionId: 'conversation.header:' + prismHeaderFingerprint(source),
+            optionId: prismHeaderEntryOptionID(source, stableTarget),
             label,
             disabled: el.getAttribute('aria-disabled') === 'true' || el.hasAttribute('disabled'),
           };
@@ -2778,6 +2812,11 @@ class CodexDesktopController extends CdpPageClient {
     if (!normalizedItemID || !normalizedOptionID) {
       throw new Error('control_target_stale: queue menu item and option are required');
     }
+    const queueBefore = await this.queuedMessageState();
+    const expectedContent = String(queueBefore && Array.isArray(queueBefore.items)
+      ? queueBefore.items.find((item) => String(item && item.id || '').trim() === normalizedItemID)?.content || ''
+      : '').trim();
+    if (!expectedContent) throw new Error('control_target_stale: queue item content is unavailable');
     await this.openQueuedMessageMenu(normalizedItemID);
     try {
       const rows = await this.evaluate(`(() => {
@@ -2791,6 +2830,12 @@ class CodexDesktopController extends CdpPageClient {
       if (matches.length !== 1) {
         throw new Error('control_target_stale: queue item menu entry is no longer uniquely available');
       }
+      const isEditMessage = await this.evaluate(`(() => {
+        ${queueDOMHelpersSource()}
+        const elements = queueMenuActionElements(${JSON.stringify(normalizedItemID)});
+        const target = elements.find((el, index) => queueRemoteActionDescriptor(el, 'item.menu', index)?.id === ${JSON.stringify(normalizedOptionID)});
+        return Boolean(target && queueMenuIconIdentity(target) === 'edit_message');
+      })()`);
       const target = `(() => {
         ${queueDOMHelpersSource()}
         const elements = queueMenuActionElements(${JSON.stringify(normalizedItemID)});
@@ -2799,12 +2844,20 @@ class CodexDesktopController extends CdpPageClient {
         return target && !target.disabled && target.getAttribute('aria-disabled') !== 'true' ? target : null;
       })()`;
       try {
-        // Queue overflow entries are Radix/Fiber-owned controls. Some entries
-        // (notably edit) only consume the pointer sequence, whereas a bare
-        // HTMLElement.click() reports success without invoking their handler.
-        await this.dispatchDomPointerClick(target);
+        await this.clickElement(target);
       } catch {
         throw new Error('control_target_stale: queue item menu entry disappeared before click');
+      }
+      if (isEditMessage) {
+        const composerText = composerContainerElementExpression();
+        await this.waitForControl(`(() => {
+          ${queueDOMHelpersSource()}
+          const queue = queueItemDescriptors();
+          const composer = ${composerText};
+          const text = String(composer && (composer.innerText || composer.textContent) || '').trim();
+          return !queue.some((item) => item.id === ${JSON.stringify(normalizedItemID)})
+            && text === ${JSON.stringify(expectedContent)};
+        })()`, "queue item edit postcondition");
       }
     } finally {
       await this.closeVisibleMenus();
@@ -3469,8 +3522,14 @@ class CodexDesktopController extends CdpPageClient {
           .filter((el) => !el.hasAttribute('aria-haspopup'))
           .filter((el) => {
             const source = prismHeaderHandlerSource(el);
-            return source && !prismHeaderDesktopOnly(source) &&
-              'conversation.header:' + prismHeaderFingerprint(source) === ${JSON.stringify(targetOptionID)};
+            const label = prismHeaderText(el);
+            const stableTarget = prismHeaderStableTarget(el);
+            const disabled = el.getAttribute('aria-disabled') === 'true' || el.hasAttribute('disabled');
+            const remoteSafe = new Set([
+              'rename-thread', 'pin-thread', 'archive-thread', 'unarchive-thread', 'delete-thread',
+            ]).has(String(stableTarget.reactKey || ''));
+            return source && label && !disabled && remoteSafe && !prismHeaderDesktopOnly(source) &&
+              prismHeaderEntryOptionID(source, stableTarget) === ${JSON.stringify(targetOptionID)};
           });
         return matches.length === 1 ? matches[0] : null;
       })()`;
@@ -4058,6 +4117,9 @@ module.exports = {
   __test: {
     goalPlanDOMHelpersSource,
     goalComposerSubmitElementExpression,
+    conversationHeaderEntryOptionID,
+    sameConversationHeaderMenuRows,
+    conversationHeaderMenuRowsExpression,
     composerEditableElementExpression,
     composerContainerElementExpression,
     visibleDesktopElementExpression,

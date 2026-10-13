@@ -59,9 +59,23 @@ test("queue menu filtering uses Codex vector identities, never localized labels"
 
   assert.ok(start >= 0 && end > start);
   assert.match(helper, /edit_message/);
+  assert.ok(helper.includes("paths[0].startsWith('M9.41506 2.54535C10.5566 1.516 12.2884 1.57105 13.3399 2.64105')"));
   assert.match(helper, /close_queue/);
   assert.match(helper, /desktop_side_chat/);
   assert.doesNotMatch(helper, /编辑消息|在侧边聊天中打开|关闭排队|Edit message|Open in side chat|Close queue/);
+});
+
+test("queue menu apply uses a CDP click and confirms native edit state", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "codex_cdp.js"), "utf8");
+  const start = source.indexOf("  async applyQueuedMessageMenuSession(");
+  const end = source.indexOf("\n  async executeQueuedMessageAction(", start);
+  const method = source.slice(start, end);
+
+  assert.ok(start >= 0 && end > start);
+  assert.match(method, /await this\.clickElement\(target\)/);
+  assert.match(method, /queue item edit postcondition/);
+  assert.match(method, /text === \$\{JSON\.stringify\(expectedContent\)\}/);
+  assert.doesNotMatch(method, /dispatchDomPointerClick\(target\)/);
 });
 
 test("direct queue actions never fall back to a native menu", () => {

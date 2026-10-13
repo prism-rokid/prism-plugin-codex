@@ -101,6 +101,43 @@ test('internal environment and integration envelopes are hidden without filterin
   assert.equal(__test.historyMessageFromRolloutRow(message(prose), 'thread').Content, prose);
 });
 
+test('image-only user messages remain visible and keep the assistant reply in the same turn', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-image-history-'));
+  const file = path.join(dir, 'rollout.jsonl');
+  const rows = [
+    {
+      type: 'response_item',
+      timestamp: '2026-10-12T03:35:37.000Z',
+      payload: {
+        type: 'message', id: 'image-user', role: 'user',
+        content: [{ type: 'input_image', name: 'prism-image-test.png' }],
+      },
+    },
+    {
+      type: 'response_item',
+      timestamp: '2026-10-12T03:35:42.000Z',
+      payload: {
+        type: 'message', id: 'image-reply', role: 'assistant', phase: 'final_answer',
+        content: [{ type: 'output_text', text: 'The image contains a test graphic.' }],
+      },
+    },
+  ];
+  try {
+    fs.writeFileSync(file, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+    const user = __test.historyMessageFromRolloutRow(rows[0], 'thread');
+    assert.equal(user.Content, '');
+    assert.deepEqual(user.Metadata, { attachments: [{ name: 'prism-image-test.png', kind: 'image' }] });
+
+    const turns = __test.historyTurnsFromTail(file, 'thread');
+    assert.equal(turns.length, 1);
+    assert.equal(turns[0].messages[0].Role, 'user');
+    assert.deepEqual(turns[0].messages[0].Metadata, { attachments: [{ name: 'prism-image-test.png', kind: 'image' }] });
+    assert.ok(turns[0].messages.some((message) => message.Role === 'assistant' && message.Content.includes('test graphic')));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('late control postcondition is reconciled without a second click', async () => {
   const c = Object.create(CodexDesktopController.prototype);
   c.options = {};

@@ -461,6 +461,19 @@ test("desktop watcher exposes foreground model and reasoning as read-only values
   assert.deepEqual(detail.reasoning_options, []);
 });
 
+test("desktop watcher uses per-thread model and reasoning metadata when no foreground composer value exists", () => {
+  const detail = __test.detailSnapshotFromDesktopWatch(THREAD_ID, {
+    thread: {
+      title: "旧会话",
+      metadata: { model: "gpt-5.5", reasoning_effort: "high" },
+    },
+    runtime: {},
+  });
+
+  assert.equal(detail.current_model.id, "gpt-5.5");
+  assert.equal(detail.current_reasoning.key, "high");
+});
+
 test("interrupt uses the Composer Fiber runtime action and never sends a global shortcut", async () => {
   const controller = Object.create(CodexDesktopController.prototype);
   let clickScript = "";

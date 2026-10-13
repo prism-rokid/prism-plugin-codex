@@ -1,7 +1,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 
-const { __test } = require("../codex_cdp.js");
+const { CodexDesktopController, __test } = require("../codex_cdp.js");
 
 const { reasoningEffortRowsFromFacts, EFFORT_CONTROL_ID } = __test;
 
@@ -92,4 +92,27 @@ test('unknown native effort identity does not invent a current selection', () =>
   const facts = nativeSliderFacts({ selectedID: 'removed:high', announcement: 'Model 轻度，第 1 项，共 3 项' });
   assert.equal(facts.index, -1);
   assert.deepEqual(reasoningEffortRowsFromFacts(facts), []);
+});
+
+test("private effort group route adjusts the slider instead of selecting a model row", async () => {
+  const controller = Object.create(CodexDesktopController.prototype);
+  const expectedRows = [{ optionId: `${EFFORT_CONTROL_ID}:2`, label: "High" }];
+  let sliderCall;
+  controller.applyReasoningEffortIndex = async (...args) => {
+    sliderCall = args;
+    return { index: 2 };
+  };
+  controller.readInteractiveSurface = async () => null;
+  controller.openIntelligenceMenu = async () => {
+    throw new Error("effort route must not open the model selection path");
+  };
+
+  const result = await controller.applyInteractiveComposerMenuSession(
+    EFFORT_CONTROL_ID,
+    `${EFFORT_CONTROL_ID}:2`,
+    expectedRows,
+  );
+
+  assert.deepEqual(sliderCall, [`${EFFORT_CONTROL_ID}:2`, expectedRows]);
+  assert.deepEqual(result, { surface: null, effort: { index: 2 } });
 });

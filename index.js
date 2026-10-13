@@ -1335,6 +1335,7 @@ function enrichThreadItemWithRollout(item) {
     ...(item.metadata || {}),
     provider: firstNonEmpty(item.metadata && item.metadata.provider, rollout.model_provider),
     model: firstNonEmpty(item.metadata && item.metadata.model, rollout.model),
+    reasoning_effort: firstNonEmpty(item.metadata && item.metadata.reasoning_effort, rollout.reasoning_effort),
     approval_mode: firstNonEmpty(item.metadata && item.metadata.approval_mode, rollout.approval_mode),
     thread_source: firstNonEmpty(rollout.thread_source, item.metadata && item.metadata.thread_source),
   };
@@ -1778,6 +1779,7 @@ function readRolloutContextMetadata(file) {
   let contextTokensUsed = "";
   let contextWindowUsagePercent = "";
   let model = "";
+  let reasoningEffort = "";
   try {
     let latestUsage = null;
     for (const row of readRolloutTailItems(file)) {
@@ -1802,6 +1804,18 @@ function readRolloutContextMetadata(file) {
       }
       if (row.type === "turn_context") {
         model = firstNonEmpty(payload.model, model);
+        const settings = payload.collaboration_mode && typeof payload.collaboration_mode === "object"
+          ? payload.collaboration_mode.settings || {}
+          : {};
+        const reasoning = payload.reasoning && typeof payload.reasoning === "object" ? payload.reasoning : {};
+        reasoningEffort = firstNonEmpty(
+          payload.reasoning_effort,
+          payload.reasoningMode,
+          payload.reasoning_mode,
+          settings.reasoning_effort,
+          reasoning.effort,
+          reasoningEffort,
+        );
       }
     }
     const windowTotal = Number(contextWindowTotal) || 0;
@@ -1825,6 +1839,7 @@ function readRolloutContextMetadata(file) {
   return Object.fromEntries(
     Object.entries({
       model,
+      reasoning_effort: reasoningEffort,
       context_tokens_used: contextTokensUsed,
       context_window_total: contextWindowTotal,
       context_window_usage_percent: contextWindowUsagePercent,
@@ -2683,10 +2698,11 @@ function historyMessageFromRolloutRow(row, threadID) {
   const content = extractMessageText(payload);
   const goalObjective = role === "user" ? goalObjectiveFromInternalUserEnvelope(content) : "";
   const visibleContent = boundedHistoryText(role === "user" ? firstNonEmpty(goalObjective, visibleUserHistoryText(content)) : content);
-  if ((role === "user" && (!visibleContent || (isInternalUserEnvelope(content) && !goalObjective))) || (role === "assistant" && isInternalAssistantNote(content))) {
+  const attachments = attachmentsFromContent(payload.content);
+  if ((role === "user" && ((!visibleContent && attachments.length === 0) || (isInternalUserEnvelope(content) && !goalObjective))) ||
+      (role === "assistant" && isInternalAssistantNote(content))) {
     return null;
   }
-  const attachments = attachmentsFromContent(payload.content);
   const timestamp = asISOString(row.timestamp_ms ?? row.timestamp ?? payload.updated_at ?? payload.created_at);
   return {
     ID: historyMessageID(row, payload, role),
@@ -3262,11 +3278,11 @@ async function loadVisibleHistory(threadID, limit = HISTORY_PAGE_LIMIT_MAX) {
     const extractedContent = extractMessageText(payload);
     const goalObjective = role === "user" ? goalObjectiveFromInternalUserEnvelope(extractedContent) : "";
     const content = role === "user" ? firstNonEmpty(goalObjective, visibleUserHistoryText(extractedContent)) : extractedContent;
-    if ((role === "user" && ((isInternalUserEnvelope(extractedContent) && !goalObjective) || !content)) ||
+    const attachments = attachmentsFromContent(payload.content);
+    if ((role === "user" && ((isInternalUserEnvelope(extractedContent) && !goalObjective) || (!content && attachments.length === 0))) ||
         (role === "assistant" && isInternalAssistantNote(extractedContent))) {
       continue;
     }
-    const attachments = attachmentsFromContent(payload.content);
     const createdAt = asISOString(
       row.timestamp_ms ?? row.timestamp ?? payload.updated_at ?? payload.created_at,
     );
@@ -4335,16 +4351,6 @@ async function readCodexInteractiveControls(controller) {
     ["model", "reasoning"],
   );
   if (intelligenceControl) controls.push(intelligenceControl);
-  // The stacked ModelPicker makes the current effort independently readable
-  // from the closed trigger, so publish it as its own control next to the
-  // combined model label.
-  const effortControl = dynamicInteractiveControl(
-    "codex.intelligence.effort",
-    "推理强度",
-    intelligence && intelligence.effort,
-    ["reasoning"],
-  );
-  if (effortControl) controls.push(effortControl);
   const permission = closed && closed.permission;
   // Codex renders only the current permission value. The stable DOM anchor is
   // technical (`permissions`), while this fixed product label keeps the
@@ -4364,6 +4370,13 @@ function purgeExpiredMenuSessions() {
   for (const [id, session] of menuSessions.entries()) {
     if (!session || nowMs >= Number(session.expires_at || 0)) menuSessions.delete(id);
   }
+}
+
+// The effort slider is an implementation detail of the combined intelligence
+// menu. It is never a public interactive-control owner.
+function isPublicInteractiveControlID(controlID = "") {
+  const normalized = String(controlID || "").trim();
+  return normalized === "codex.intelligence" || normalized === "codex.permission";
 }
 
 function sameMenuOwner(left = null, right = null) {
@@ -4473,6 +4486,9 @@ async function describeCodexMenuSession(threadID = "", owner = null, options = {
     if (ownerKind === "interactive_control" && !controlID) {
       throw new Error("control_target_stale: menu owner requires control_id");
     }
+    if (ownerKind === "interactive_control" && !isPublicInteractiveControlID(controlID)) {
+      throw new Error(`unsupported control operation: ${controlID || "unknown"}`);
+    }
     if (ownerKind === "queue_item" && !queueItemID) {
       throw new Error("control_target_stale: menu owner requires queue_item_id");
     }
@@ -4515,9 +4531,6 @@ async function describeCodexMenuSession(threadID = "", owner = null, options = {
       }
       if (controlID === "codex.intelligence") {
         return { rows: [], groups: await controller.listIntelligenceMenuGroups() };
-      }
-      if (controlID === "codex.intelligence.effort") {
-        return { rows: await controller.listReasoningEffortOptions(), groups: [] };
       }
       return { rows: await controller.listIntelligenceControlOptions(controlID), groups: [] };
     });
@@ -4832,7 +4845,8 @@ async function conversationDetailSnapshotFromDesktop(threadID = "", options = {}
     throw new Error("codex detail snapshot requires a resolved Codex thread id");
   }
   const controller = await codexDesktopController();
-  const thread = await findThreadByID(threadID).catch(() => null);
+  const thread = withRolloutContextMetadata(await findThreadByID(threadID).catch(() => null));
+  const recordedControls = recordedThreadControlValues(thread);
   let selectResult = null;
   if (options.selectThread !== false) {
     selectResult = await controller.selectThread(threadID);
@@ -4903,8 +4917,8 @@ async function conversationDetailSnapshotFromDesktop(threadID = "", options = {}
     pinned: typeof livePinned === "boolean" ? livePinned : undefined,
     // These are display-only values read from the already-open foreground
     // Composer. Keep option menus empty until the user explicitly opens one.
-    current_model: liveCurrent && liveCurrent.model || null,
-    current_reasoning: liveCurrent && liveCurrent.reasoning || null,
+    current_model: liveCurrent && liveCurrent.model || recordedControls.model,
+    current_reasoning: liveCurrent && liveCurrent.reasoning || recordedControls.reasoning,
     current_permission: liveCurrent && liveCurrent.approval || null,
     model_options: [],
     reasoning_options: [],
@@ -6111,6 +6125,7 @@ function detailSnapshotFromDesktopWatch(threadID = "", snapshot = {}, messagesSi
   if (!isThreadID(threadID)) return null;
   const runtime = snapshot && snapshot.runtime && typeof snapshot.runtime === "object" ? snapshot.runtime : {};
   const thread = snapshot && snapshot.thread && typeof snapshot.thread === "object" ? snapshot.thread : null;
+  const recordedControls = recordedThreadControlValues(thread);
   const cachedOptions = liveControlOptionsCacheEntry(threadID);
   const run = controlsRuntimeFromDesktopSnapshot(threadID, runtime) || {
     status: "idle",
@@ -6130,8 +6145,8 @@ function detailSnapshotFromDesktopWatch(threadID = "", snapshot = {}, messagesSi
     pinned: typeof snapshot.pinned === "boolean" ? snapshot.pinned : undefined,
     // The watcher only observes the foreground Composer; these remain
     // read-only until a user-initiated menu_session.describe verifies options.
-    current_model: snapshot.composer && snapshot.composer.model || null,
-    current_reasoning: snapshot.composer && snapshot.composer.reasoning || null,
+    current_model: snapshot.composer && snapshot.composer.model || recordedControls.model,
+    current_reasoning: snapshot.composer && snapshot.composer.reasoning || recordedControls.reasoning,
     current_permission: snapshot.composer && snapshot.composer.approval || null,
     model_options: [],
     reasoning_options: [],
@@ -6152,6 +6167,17 @@ function detailSnapshotFromDesktopWatch(threadID = "", snapshot = {}, messagesSi
     messages_signature: firstNonEmpty(messagesSignature),
     ...detailContextFields(thread),
     run,
+  };
+}
+
+function recordedThreadControlValues(thread = null) {
+  const metadata = thread && thread.metadata && typeof thread.metadata === "object" ? thread.metadata : {};
+  const updatedAt = firstNonEmpty(thread && thread.updatedAt);
+  const model = modelInfoFromLabel(firstNonEmpty(metadata.model), updatedAt);
+  const reasoning = reasoningModeFromValue(firstNonEmpty(metadata.reasoning_effort), updatedAt);
+  return {
+    model: model.available ? model : null,
+    reasoning: reasoning.available ? reasoning : null,
   };
 }
 
@@ -7019,6 +7045,7 @@ module.exports = {
     liveReasoningOptionFromRow,
     desktopRawLabel,
     dynamicInteractiveControl,
+    isPublicInteractiveControlID,
     menuSessionRows,
     createPluginMenuSession,
     withPermissionOptionCurrent,
