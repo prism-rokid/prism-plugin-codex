@@ -42,9 +42,10 @@ test("conversation header describe and apply share the snapshot-bound entry iden
   assert.match(source, /prismHeaderStableTarget/);
   assert.match(source, /depth < 32/);
   assert.match(source, /aria-keyshortcuts/);
-  assert.match(source, /rename-thread.*pin-thread.*archive-thread/);
+  assert.match(source, /rename-thread.*pin-thread.*unpin-thread.*archive-thread/);
   assert.match(source, /prismHeaderRemoteSafe\(stableTarget\)/);
   assert.match(source, /aria-haspopup/);
   assert.match(implementation, /prismHeaderEntryOptionID\(source, stableTarget\) ===/);
+  assert.equal((implementation.match(/'unpin-thread'/g) || []).length, 2);
   assert.doesNotMatch(source, /row\.label|saved\.label|index/);
 });

@@ -37,6 +37,7 @@ function fixture(depth, mode = 'submit', queue = true, secondOwner = false) {
   const document = { querySelectorAll: selector => selector === '.composer-attachment-surface' ? [] : [composer] };
   const controller = Object.create(CodexDesktopController.prototype);
   controller.ensureReady = async () => {};
+  controller.waitFor = async () => true;
   const Event = class { constructor(type) { this.type = type; } };
   controller.evaluate = source => vm.runInNewContext(source, { document, MouseEvent: Event, PointerEvent: Event });
   let clicked;

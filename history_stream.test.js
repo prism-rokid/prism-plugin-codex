@@ -108,6 +108,46 @@ withRollout([
   assert.doesNotMatch(JSON.stringify(user.Metadata.attachments), /data:|base64|\/private\//i);
 });
 
+{
+  const createdAt = "2026-10-14T06:00:00.000Z";
+  const rolloutRow = {
+    type: "response_item",
+    timestamp: createdAt,
+    payload: {
+      type: "message",
+      id: "user-image-with-generated-name",
+      role: "user",
+      content: [
+        { type: "input_text", text: "## My request:\n描述这张图" },
+        { type: "input_image", name: "codex-clipboard-1234.png" },
+      ],
+    },
+  };
+  const hint = {
+    content_hash: __test.attachmentTextHash("描述这张图"),
+    sent_at: Date.parse(createdAt) + 1000,
+    names: ["Prism-qa-codex-image-20261014.png"],
+  };
+  const restored = __test.historyMessageFromRolloutRow(rolloutRow, "thread-image-name", [hint]);
+  assert.deepEqual(restored.Metadata.attachments, [{ name: "Prism-qa-codex-image-20261014.png", kind: "image" }]);
+
+  const differentPrompt = __test.historyMessageFromRolloutRow({
+    ...rolloutRow,
+    payload: {
+      ...rolloutRow.payload,
+      content: [
+        { type: "input_text", text: "## My request:\n另一条消息" },
+        { type: "input_image", name: "codex-clipboard-1234.png" },
+      ],
+    },
+  }, "thread-image-name", [hint]);
+  assert.deepEqual(differentPrompt.Metadata.attachments, [{ name: "codex-clipboard-1234.png", kind: "image" }]);
+
+  const staleHint = { ...hint, sent_at: Date.parse("2026-10-01T06:00:00.000Z") };
+  const stale = __test.historyMessageFromRolloutRow(rolloutRow, "thread-image-name", [staleHint]);
+  assert.deepEqual(stale.Metadata.attachments, [{ name: "codex-clipboard-1234.png", kind: "image" }]);
+}
+
 withRollout([
   row("2026-08-13T01:00:00.000Z", {
     type: "message",

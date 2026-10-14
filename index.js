@@ -2265,13 +2265,13 @@ function inferPhaseFromSteps(steps = []) {
   return null;
 }
 
-async function markerVisible(threadID, marker) {
+async function markerVisible(threadID, marker, options = {}) {
   const file = await findRolloutFile(threadID);
   if (!file) {
     return { visible: false, evidence: "", failureReason: "codex rollout file not found" };
   }
   try {
-    if (rolloutContainsVisibilityMarker(file, marker)) {
+    if (rolloutContainsVisibilityMarker(file, marker, options)) {
       return { visible: true, evidence: file, failureReason: "" };
     }
     return { visible: false, evidence: file, failureReason: "marker not found in Codex thread/read history" };
@@ -2280,7 +2280,7 @@ async function markerVisible(threadID, marker) {
   }
 }
 
-function rolloutContainsVisibilityMarker(file, marker) {
+function rolloutContainsVisibilityMarker(file, marker, options = {}) {
   const expected = String(marker || "").trim();
   if (!expected) return false;
   for (const row of readRecentRolloutRows(file, 1)) {
@@ -2290,10 +2290,16 @@ function rolloutContainsVisibilityMarker(file, marker) {
       return true;
     }
     if (payload.type !== "message" || String(payload.role || "").toLowerCase() !== "user") continue;
+    const rowTime = Date.parse(firstNonEmpty(row.timestamp, row.timestamp_ms));
+    const sinceMs = Number(options.sinceMs) || 0;
+    if (sinceMs > 0 && Number.isFinite(rowTime) && rowTime < sinceMs) continue;
     if (extractTextFromContent(payload.content, "user").includes(expected)) {
       return true;
     }
     if (attachmentsFromContent(payload.content).some((attachment) => attachment.name === expected)) {
+      return true;
+    }
+    if (options.allowAttachmentMatch === true && attachmentsFromContent(payload.content).length > 0) {
       return true;
     }
   }
@@ -2416,6 +2422,51 @@ function attachmentsFromContent(content) {
     });
   }
   return attachments;
+}
+
+function attachmentTextHash(text = "") {
+  const visible = normalizeHistoryText(visibleUserHistoryText(text));
+  return visible ? crypto.createHash("sha256").update(visible).digest("hex") : "";
+}
+
+function rememberThreadAttachmentNames(threadID, messageID, text, attachments, sentAt = Date.now()) {
+  const names = (Array.isArray(attachments) ? attachments : [])
+    .map((attachment) => firstNonEmpty(attachment && attachment.Name, attachment && attachment.name))
+    .filter(Boolean);
+  if (!names.length) return;
+  const state = threadPluginState(threadID);
+  const hints = Array.isArray(state.attachment_name_hints) ? state.attachment_name_hints : [];
+  const id = firstNonEmpty(messageID);
+  const next = hints.filter((hint) => !id || firstNonEmpty(hint && hint.message_id) !== id);
+  next.push({
+    ...(id ? { message_id: id } : {}),
+    content_hash: attachmentTextHash(text),
+    sent_at: Number(sentAt) || Date.now(),
+    names,
+  });
+  updateThreadPluginState(threadID, { attachment_name_hints: next.slice(-128) });
+}
+
+function attachmentNameHintForHistoryMessage(message, hints = []) {
+  const attachments = message && message.Metadata && Array.isArray(message.Metadata.attachments)
+    ? message.Metadata.attachments
+    : [];
+  if (!attachments.length || !Array.isArray(hints)) return null;
+  const contentHash = attachmentTextHash(message.Content);
+  const messageAt = Date.parse(message.CreatedAt || "");
+  const candidates = hints.filter((hint) => {
+    if (!hint || !Array.isArray(hint.names) || hint.names.length !== attachments.length) return false;
+    if (contentHash ? hint.content_hash !== contentHash : Boolean(hint.content_hash)) return false;
+    const sentAt = Number(hint.sent_at) || 0;
+    return !messageAt || !sentAt || Math.abs(messageAt - sentAt) <= 24 * 60 * 60 * 1000;
+  });
+  if (!candidates.length) return null;
+  if (!messageAt) return candidates.at(-1);
+  return candidates.reduce((closest, candidate) =>
+    Math.abs(messageAt - (Number(candidate.sent_at) || 0)) < Math.abs(messageAt - (Number(closest.sent_at) || 0))
+      ? candidate
+      : closest,
+  );
 }
 
 function historyMessageID(row, payload, role) {
@@ -2687,7 +2738,7 @@ function historyRuntimeNotices(threadID) {
   return historyRuntimeNoticeCache.get(threadID) || { notices: [], revision: 0 };
 }
 
-function historyMessageFromRolloutRow(row, threadID) {
+function historyMessageFromRolloutRow(row, threadID, attachmentHints = null) {
   const payload = row && row.payload;
   if (!payload || typeof payload !== "object" || row.type !== "response_item" || payload.type !== "message") {
     return null;
@@ -2704,7 +2755,7 @@ function historyMessageFromRolloutRow(row, threadID) {
     return null;
   }
   const timestamp = asISOString(row.timestamp_ms ?? row.timestamp ?? payload.updated_at ?? payload.created_at);
-  return {
+  const message = {
     ID: historyMessageID(row, payload, role),
     TurnID: firstNonEmpty(
       payload.turn_id,
@@ -2719,6 +2770,17 @@ function historyMessageFromRolloutRow(row, threadID) {
     UpdatedAt: timestamp,
     Metadata: attachments.length ? { attachments } : {},
   };
+  const hints = Array.isArray(attachmentHints)
+    ? attachmentHints
+    : threadPluginState(threadID).attachment_name_hints;
+  const hint = attachmentNameHintForHistoryMessage(message, hints);
+  if (hint) {
+    message.Metadata.attachments = attachments.map((attachment, index) => ({
+      ...attachment,
+      name: hint.names[index],
+    }));
+  }
+  return message;
 }
 
 function isInternalUserHistoryRow(row) {
@@ -2953,11 +3015,11 @@ function runtimeWithRecordedTerminal(runtime, terminalState = null) {
   if (!runtime || typeof runtime !== "object" || !terminalState || terminalState.terminal !== true) {
     return runtime;
   }
-  // Rollout files describe the last persisted user turn. They cannot override
-  // a currently rendered approval, running turn, or Goal lifecycle surface.
-  // Those are live Desktop state and must remain actionable on remote clients.
+  // The lifecycle belongs to the latest persisted user turn, so its terminal
+  // event is more precise than a Composer Stop state that can lag completion.
+  // Approval and Goal controls remain live surfaces and must stay actionable.
   const goalStatus = String(runtime.goal && runtime.goal.status || "none").trim().toLowerCase();
-  if (runtime.running === true || runtime.waiting_approval === true || ["running", "paused"].includes(goalStatus)) {
+  if (runtime.waiting_approval === true || ["running", "paused"].includes(goalStatus)) {
     return runtime;
   }
   return {
@@ -3747,16 +3809,16 @@ function summarizeRolloutChunk(file, offset = 0) {
   }
 }
 
-async function waitForMarker(threadID, marker) {
+async function waitForMarker(threadID, marker, options = {}) {
   const deadline = Date.now() + VISIBILITY_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const res = await markerVisible(threadID, marker);
+    const res = await markerVisible(threadID, marker, options);
     if (res.visible) {
       return res;
     }
     await sleep(VISIBILITY_POLL_MS);
   }
-  return markerVisible(threadID, marker);
+  return markerVisible(threadID, marker, options);
 }
 
 function sleep(ms) {
@@ -3867,7 +3929,19 @@ async function startSessionWithMessage(req) {
       updateStartedSessionState(messageID, { thread_id: recoveredThreadID });
     }
     const session = toSession(recoveredThreadID, firstNonEmpty(previous.cwd));
-    const visibility = await verifyVisibility(session, visibilityMarker);
+    rememberThreadAttachmentNames(
+      recoveredThreadID,
+      messageID,
+      firstNonEmpty(previous.text, text),
+      (Array.isArray(previous.attachment_names) && previous.attachment_names.length
+        ? previous.attachment_names.map((Name) => ({ Name }))
+        : attachments),
+      Date.parse(firstNonEmpty(previous.started_at)) || Date.now(),
+    );
+    const visibility = await verifyVisibility(session, visibilityMarker, {
+      allowAttachmentMatch: attachments.length > 0 || (Array.isArray(previous.attachment_names) && previous.attachment_names.length > 0),
+      sinceMs: Date.parse(firstNonEmpty(previous.started_at)) || 0,
+    });
     if (!visibility.Visible) {
       throw new Error("codex start outcome is unknown; refusing to create or send a duplicate first message");
     }
@@ -3913,6 +3987,7 @@ async function startSessionWithMessage(req) {
     previous_thread_id: previousThreadID,
     cwd,
     text,
+    attachment_names: attachments.map((attachment) => firstNonEmpty(attachment && attachment.Name)).filter(Boolean),
     started_at: new Date(startedAt).toISOString(),
     status: isThreadID(threadID) ? "created" : "launching",
   });
@@ -3936,6 +4011,7 @@ async function startSessionWithMessage(req) {
   if (!isThreadID(threadID)) {
     throw new Error("codex could not obtain a new direct active thread id after creating a new thread");
   }
+  rememberThreadAttachmentNames(threadID, messageID, text, attachments, startedAt);
   updateStartedSessionState(messageID, { thread_id: threadID, status: "created" });
   const runContext = {
     thread_id: threadID,
@@ -3945,7 +4021,7 @@ async function startSessionWithMessage(req) {
   const nativeMessageID = encodeRunContext(runContext);
   updateStartedSessionState(messageID, { native_message_id: nativeMessageID, status: "submitted" });
   const session = toSession(threadID, cwd);
-  const visibility = await verifyVisibility(session, visibilityMarker);
+  const visibility = await verifyVisibility(session, visibilityMarker, { allowAttachmentMatch: attachments.length > 0, sinceMs: startedAt });
   if (!visibility.Visible) {
     throw new Error(`codex could not verify the first message: ${firstNonEmpty(visibility.FailureReason)}`);
   }
@@ -4173,12 +4249,31 @@ async function startDraftWithMessage(req) {
     });
     if (!isThreadID(threadID)) throw new Error("codex draft start outcome is unknown; refusing duplicate first message");
     const session = toSession(threadID, firstNonEmpty(previous.cwd, draft.cwd));
-    const visibility = await verifyVisibility(session, visibilityMarker);
+    rememberThreadAttachmentNames(
+      threadID,
+      messageID,
+      firstNonEmpty(previous.text, text),
+      (Array.isArray(previous.attachment_names) && previous.attachment_names.length
+        ? previous.attachment_names.map((Name) => ({ Name }))
+        : attachments),
+      Date.parse(firstNonEmpty(previous.started_at)) || Date.now(),
+    );
+    const visibility = await verifyVisibility(session, visibilityMarker, {
+      allowAttachmentMatch: attachments.length > 0 || (Array.isArray(previous.attachment_names) && previous.attachment_names.length > 0),
+      sinceMs: Date.parse(firstNonEmpty(previous.started_at)) || 0,
+    });
     if (!visibility.Visible) throw new Error("codex draft start outcome is unknown; refusing duplicate first message");
     return { Session: session, Receipt: { NativeMessageID: firstNonEmpty(previous.native_message_id, messageID), Accepted: true, Visible: true, Detail: "duplicate Codex draft start" }, Visibility: visibility };
   }
   const startedAt = Date.now();
-  updateStartedSessionState(messageID, { previous_thread_id: draft.previous_thread_id, cwd: draft.cwd, text, started_at: now(), status: "launching" });
+  updateStartedSessionState(messageID, {
+    previous_thread_id: draft.previous_thread_id,
+    cwd: draft.cwd,
+    text,
+    attachment_names: attachments.map((attachment) => firstNonEmpty(attachment && attachment.Name)).filter(Boolean),
+    started_at: now(),
+    status: "launching",
+  });
   await controller.sendMessage({
     text,
     attachments: attachments.map((attachment) => ({
@@ -4189,12 +4284,13 @@ async function startDraftWithMessage(req) {
   });
   const threadID = await resolveStartedThreadIDAfterSend({ previousThreadID: draft.previous_thread_id, timeoutMs: THREAD_POST_SEND_RESOLVE_MS });
   if (!isThreadID(threadID)) throw new Error("codex could not obtain a native thread id after draft submission");
+  rememberThreadAttachmentNames(threadID, messageID, text, attachments, startedAt);
   updateStartedSessionState(messageID, { thread_id: threadID, status: "created" });
   const runContext = { thread_id: threadID, started_at: startedAt, ...(await rolloutCursor(threadID)) };
   const nativeMessageID = encodeRunContext(runContext);
   updateStartedSessionState(messageID, { native_message_id: nativeMessageID, status: "submitted" });
   const session = toSession(threadID, draft.cwd);
-  const visibility = await verifyVisibility(session, visibilityMarker);
+  const visibility = await verifyVisibility(session, visibilityMarker, { allowAttachmentMatch: attachments.length > 0, sinceMs: startedAt });
   if (!visibility.Visible) throw new Error(`codex could not verify the draft first message: ${firstNonEmpty(visibility.FailureReason)}`);
   updateStartedSessionState(messageID, { status: "visible" });
   mobileDrafts.delete(draftID);
@@ -5748,6 +5844,7 @@ async function send(session, msg) {
     } catch (error) {
       throw error;
     }
+    rememberThreadAttachmentNames(threadID, firstNonEmpty(msg && msg.PrismMessageID), text, attachments, sendStartedAt);
     logTiming(sendActionLabel, sendActionStartedAt);
     if (!runContext) {
       runContext = {
@@ -6171,7 +6268,8 @@ function detailSnapshotFromDesktopWatch(threadID = "", snapshot = {}, messagesSi
 }
 
 function recordedThreadControlValues(thread = null) {
-  const metadata = thread && thread.metadata && typeof thread.metadata === "object" ? thread.metadata : {};
+  const enriched = withRolloutContextMetadata(thread);
+  const metadata = enriched && enriched.metadata && typeof enriched.metadata === "object" ? enriched.metadata : {};
   const updatedAt = firstNonEmpty(thread && thread.updatedAt);
   const model = modelInfoFromLabel(firstNonEmpty(metadata.model), updatedAt);
   const reasoning = reasoningModeFromValue(firstNonEmpty(metadata.reasoning_effort), updatedAt);
@@ -6832,9 +6930,9 @@ async function interrupt(session) {
   });
 }
 
-async function verifyVisibility(session, marker) {
+async function verifyVisibility(session, marker, options = {}) {
   const threadID = firstNonEmpty(session && session.NativeThreadID, session && session.NativeSessionID);
-  const result = await waitForMarker(threadID, marker);
+  const result = await waitForMarker(threadID, marker, options);
   return {
     Visible: result.visible,
     Marker: marker,
@@ -7031,6 +7129,8 @@ module.exports = {
     historyMessageID,
     historyMessageSignature,
     visibleUserHistoryText,
+    attachmentTextHash,
+    attachmentNameHintForHistoryMessage,
     goalObjectiveFromInternalUserEnvelope,
     rememberVisibleGoalBody,
     rememberVisibleGoalBodyFromForegroundRuntime,

@@ -1452,7 +1452,7 @@ function conversationHeaderMenuHelpersSource() {
       };
     };
     const prismHeaderRemoteSafe = (target) => new Set([
-      'rename-thread', 'pin-thread', 'archive-thread', 'unarchive-thread', 'delete-thread',
+      'rename-thread', 'pin-thread', 'unpin-thread', 'archive-thread', 'unarchive-thread', 'delete-thread',
     ]).has(String(target && target.reactKey || ''));
     const prismHeaderHandlerSource = (el) => {
       const sources = [];
@@ -3526,7 +3526,7 @@ class CodexDesktopController extends CdpPageClient {
             const stableTarget = prismHeaderStableTarget(el);
             const disabled = el.getAttribute('aria-disabled') === 'true' || el.hasAttribute('disabled');
             const remoteSafe = new Set([
-              'rename-thread', 'pin-thread', 'archive-thread', 'unarchive-thread', 'delete-thread',
+              'rename-thread', 'pin-thread', 'unpin-thread', 'archive-thread', 'unarchive-thread', 'delete-thread',
             ]).has(String(stableTarget.reactKey || ''));
             return source && label && !disabled && remoteSafe && !prismHeaderDesktopOnly(source) &&
               prismHeaderEntryOptionID(source, stableTarget) === ${JSON.stringify(targetOptionID)};
@@ -4037,11 +4037,14 @@ class CodexDesktopController extends CdpPageClient {
     if (!clicked || clicked.ok !== true) {
       throw new Error(clicked && clicked.reason ? clicked.reason : "interrupt_control_unavailable");
     }
-    // The click above invokes Codex's live Composer handler. Its visual
-    // progress state can remain `stop` while the desktop finishes cancelling
-    // tools, so waiting for it to disappear turns a successfully dispatched
-    // interruption into a false adapter failure. The plugin-wide watcher is
-    // responsible for publishing the eventual terminal state.
+    // A dispatched click is not proof that Codex stopped the active run.
+    // Wait until the Composer reports that response generation has ended so
+    // Prism does not acknowledge a no-op as a successful interrupt.
+    await this.waitFor(`(() => {
+      ${composerPrimaryActionFactsSource()}
+      const facts = prismComposerPrimaryActionFacts();
+      return Boolean(facts && facts.usable === true && facts.response_in_progress !== true);
+    })()`, this.options?.actionTimeoutMs || DEFAULT_ACTION_TIMEOUT_MS, 100);
   }
 
   async resolveApproval(actionId, inputValue = "") {

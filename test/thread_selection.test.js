@@ -474,17 +474,46 @@ test("desktop watcher uses per-thread model and reasoning metadata when no foreg
   assert.equal(detail.current_reasoning.key, "high");
 });
 
-test("interrupt uses the Composer Fiber runtime action and never sends a global shortcut", async () => {
+test("desktop watcher reads historical model and reasoning from the thread rollout", () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prism-codex-watch-metadata-"));
+  const rollout = path.join(dir, `rollout-${THREAD_ID}.jsonl`);
+  try {
+    fs.writeFileSync(rollout, `${JSON.stringify({
+      type: "turn_context",
+      payload: {
+        model: "gpt-5.6",
+        collaboration_mode: { settings: { reasoning_effort: "high" } },
+      },
+    })}\n`);
+    const detail = __test.detailSnapshotFromDesktopWatch(THREAD_ID, {
+      thread: { id: THREAD_ID, rolloutPath: rollout },
+      runtime: {},
+    });
+
+    assert.equal(detail.current_model.id, "gpt-5.6");
+    assert.equal(detail.current_reasoning.key, "high");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("interrupt waits until the Composer confirms response generation stopped", async () => {
   const controller = Object.create(CodexDesktopController.prototype);
   let clickScript = "";
+  let waitExpression = "";
   let keyPresses = 0;
   controller.ensureReady = async () => {};
   controller.evaluate = async (source) => {
     clickScript = source;
     return { ok: true };
   };
-  controller.waitFor = async () => {
-    throw new Error("interrupt should not wait for the desktop render to settle");
+  controller.waitFor = async (condition, timeout, interval) => {
+    waitExpression = condition;
+    assert.ok(timeout > 0);
+    assert.equal(interval, 100);
   };
   controller.keyPress = async () => {
     keyPresses += 1;
@@ -498,6 +527,8 @@ test("interrupt uses the Composer Fiber runtime action and never sends a global 
   assert.match(clickScript, /facts\.mode !== 'stop'/);
   assert.doesNotMatch(clickScript, /停止\|Stop|发送\|Send|排队\|队列\|Queue/);
   assert.match(clickScript, /pointerdown/);
+  assert.match(waitExpression, /response_in_progress !== true/);
+  assert.match(waitExpression, /submitButtonMode/);
   assert.equal(keyPresses, 0);
 });
 
@@ -629,6 +660,7 @@ test("interrupt clicks only the native Stop action when dictation shares the foo
     MouseEvent: class { constructor(type) { this.type = type; } },
     PointerEvent: class { constructor(type) { this.type = type; } },
   });
+  controller.waitFor = async () => true;
   await controller.interrupt();
   assert.equal(events.length, 5);
   assert.ok(events.every(([name]) => name === "stop"));

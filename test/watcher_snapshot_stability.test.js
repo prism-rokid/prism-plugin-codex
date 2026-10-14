@@ -291,6 +291,25 @@ test("live Desktop approval is not replaced by an older completed rollout turn",
   }
 });
 
+test("latest rollout terminal overrides a stale running Composer state", () => {
+  const terminal = {
+    terminal: true,
+    status: "completed",
+    completedAt: "2026-08-03T00:00:01.000Z",
+  };
+  const runtime = __test.runtimeWithRecordedTerminal({
+    current_thread_id: "11111111-1111-4111-8111-111111111111",
+    running: true,
+    waiting_approval: false,
+    primary_action: "interrupt",
+  }, terminal);
+
+  assert.equal(runtime.running, false);
+  assert.equal(runtime.interrupt_available, false);
+  assert.equal(runtime.primary_action, "send");
+  assert.equal(runtime.recorded_terminal.status, "completed");
+});
+
 test("completed rollout remains the fallback when Desktop has no live state", () => {
   const runtime = __test.runtimeWithRecordedTerminal({
     current_thread_id: "11111111-1111-4111-8111-111111111111",
