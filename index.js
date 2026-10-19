@@ -1281,15 +1281,16 @@ function rolloutSessionMetadata(file) {
 }
 
 function readRolloutHeadMetadata(file, stat) {
-  // session_meta is written at the very beginning of a rollout. Parse head
-  // lines lazily and stop at the first session_meta row instead of parsing
-  // every head line; a scan cap bounds the no-session_meta case.
+  // session_meta and the first turn_context are written at the beginning of
+  // a rollout. Parse only the bounded head; history metadata must remain
+  // available even when a large file's recent tail no longer contains them.
   const size = Math.min(stat.size, ROLLOUT_SESSION_METADATA_HEAD_BYTES);
   const fd = fs.openSync(file, "r");
   try {
     const buffer = Buffer.allocUnsafe(size);
     fs.readSync(fd, buffer, 0, size, 0);
     let scanned = 0;
+    const metadata = {};
     for (const line of buffer.toString("utf8").split(/\r?\n/)) {
       const trimmed = line.trim();
       if (!trimmed) continue;
@@ -1302,22 +1303,36 @@ function readRolloutHeadMetadata(file, stat) {
         // Ignore partial rows still being written.
         continue;
       }
-      if (!row || row.type !== "session_meta" || !row.payload || typeof row.payload !== "object") {
+      if (!row || !row.payload || typeof row.payload !== "object") {
         continue;
       }
       const payload = row.payload;
-      return {
-        cwd: firstNonEmpty(payload.cwd),
-        thread_source: firstNonEmpty(payload.thread_source, payload.source),
-        model: firstNonEmpty(payload.model),
-        model_provider: firstNonEmpty(payload.model_provider),
-        approval_mode: firstNonEmpty(payload.approval_policy, payload.approval_mode),
-      };
+      if (row.type === "session_meta") {
+        metadata.cwd = firstNonEmpty(payload.cwd, metadata.cwd);
+        metadata.thread_source = firstNonEmpty(payload.thread_source, payload.source, metadata.thread_source);
+        metadata.model = firstNonEmpty(payload.model, metadata.model);
+        metadata.model_provider = firstNonEmpty(payload.model_provider, metadata.model_provider);
+        metadata.approval_mode = firstNonEmpty(payload.approval_policy, payload.approval_mode, metadata.approval_mode);
+      } else if (row.type === "turn_context") {
+        const settings = payload.collaboration_mode && typeof payload.collaboration_mode === "object"
+          ? payload.collaboration_mode.settings || {}
+          : {};
+        const reasoning = payload.reasoning && typeof payload.reasoning === "object" ? payload.reasoning : {};
+        metadata.model = firstNonEmpty(payload.model, settings.model, metadata.model);
+        metadata.reasoning_effort = firstNonEmpty(
+          payload.reasoning_effort,
+          payload.reasoningMode,
+          payload.reasoning_mode,
+          settings.reasoning_effort,
+          reasoning.effort,
+          metadata.reasoning_effort,
+        );
+      }
     }
+    return metadata;
   } finally {
     fs.closeSync(fd);
   }
-  return {};
 }
 
 function enrichThreadItemWithRollout(item) {
@@ -3474,7 +3489,10 @@ function withRolloutContextMetadata(thread = null) {
   const file = thread.rolloutPath && fs.existsSync(thread.rolloutPath) && !isArchivedRolloutPath(thread.rolloutPath)
     ? thread.rolloutPath
     : findRolloutFileFromScan(thread.id);
-  const metadata = rolloutContextMetadata(file);
+  const metadata = {
+    ...rolloutSessionMetadata(file),
+    ...rolloutContextMetadata(file),
+  };
   if (!Object.keys(metadata).length) {
     return thread;
   }

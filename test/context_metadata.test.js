@@ -69,3 +69,35 @@ test("historical thread metadata includes reasoning effort from the rollout turn
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("historical metadata keeps the first turn context when the rollout tail is large", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "prism-codex-large-rollout-metadata-"));
+  const rollout = path.join(dir, "rollout-2026-09-22T20-45-27-01a0c926-55f7-79d2-96af-ae59b9e6e304.jsonl");
+  try {
+    fs.writeFileSync(rollout, [
+      JSON.stringify({ type: "session_meta", payload: { cwd: "/tmp/old", model: null } }),
+      JSON.stringify({
+        type: "turn_context",
+        payload: {
+          model: "gpt-5.6-sol",
+          collaboration_mode: { settings: { model: "gpt-5.6-sol", reasoning_effort: "high" } },
+        },
+      }),
+      ...Array.from({ length: 1600 }, (_, index) => JSON.stringify({
+        type: "event_msg",
+        payload: { type: "item_completed", text: `${index} ${"x".repeat(120)}` },
+      })),
+    ].join("\n") + "\n");
+
+    const thread = __test.withRolloutContextMetadata({
+      id: "01a0c926-55f7-79d2-96af-ae59b9e6e304",
+      rolloutPath: rollout,
+      metadata: {},
+    });
+
+    assert.equal(thread.metadata.model, "gpt-5.6-sol");
+    assert.equal(thread.metadata.reasoning_effort, "high");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

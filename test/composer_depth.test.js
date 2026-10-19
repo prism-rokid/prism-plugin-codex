@@ -58,9 +58,7 @@ for (const depth of [26, 60]) {
   test(`depth ${depth} interrupts only the real Stop button`, async () => {
     const f = fixture(depth, 'stop');
     await f.controller.interrupt();
-    assert.equal(f.events.length, 5);
-    assert.ok(f.events.every(([button]) => button === 'primary'));
-    assert.equal(f.events.at(-1)[1], 'click');
+    assert.equal(f.getClicked(), f.primary);
   });
 }
 

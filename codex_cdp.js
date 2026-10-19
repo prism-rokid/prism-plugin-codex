@@ -481,27 +481,17 @@ function composerPrimaryActionRuntimeExpression() {
   })()`;
 }
 
-function composerStopClickExpression() {
+function composerStopElementExpression() {
   return `(() => {
     ${composerPrimaryActionFactsSource()}
     const facts = prismComposerPrimaryActionFacts();
     if (!facts || facts.usable !== true || facts.enabled !== true || facts.response_in_progress !== true || facts.mode !== 'stop') {
-      return { ok: false, reason: 'interrupt_control_unavailable' };
+      return null;
     }
     // Dictation and other utility buttons share this footer. Resolve the
     // primary action by its native Composer contract, just as send does.
     const action = ${composerPrimaryActionElementExpression()};
-    if (!action) return { ok: false, reason: 'interrupt_control_unavailable' };
-    action.focus && action.focus();
-    const pointer = { bubbles: true, cancelable: true, pointerId: 1, pointerType: 'mouse', button: 0, buttons: 1 };
-    const down = { bubbles: true, cancelable: true, button: 0, buttons: 1 };
-    const up = { bubbles: true, cancelable: true, button: 0, buttons: 0 };
-    try { action.dispatchEvent(new PointerEvent('pointerdown', pointer)); } catch {}
-    try { action.dispatchEvent(new MouseEvent('mousedown', down)); } catch {}
-    try { action.dispatchEvent(new PointerEvent('pointerup', { ...pointer, buttons: 0 })); } catch {}
-    try { action.dispatchEvent(new MouseEvent('mouseup', up)); } catch {}
-    try { action.dispatchEvent(new MouseEvent('click', up)); } catch {}
-    return { ok: true };
+    return action || null;
   })()`;
 }
 
@@ -4033,10 +4023,12 @@ class CodexDesktopController extends CdpPageClient {
 
   async interrupt() {
     await this.ensureReady();
-    const clicked = await this.evaluate(composerStopClickExpression());
-    if (!clicked || clicked.ok !== true) {
-      throw new Error(clicked && clicked.reason ? clicked.reason : "interrupt_control_unavailable");
-    }
+    // Recheck the native Composer state in the target expression, then use
+    // CDP's trusted mouse input. Synthetic DOM events can look like a click to
+    // the caller without activating Codex's React handler.
+    await this.clickElement(composerStopElementExpression()).catch((error) => {
+      throw new Error(`interrupt_control_unavailable: ${error.message}`);
+    });
     // A dispatched click is not proof that Codex stopped the active run.
     // Wait until the Composer reports that response generation has ended so
     // Prism does not acknowledge a no-op as a successful interrupt.

@@ -502,14 +502,11 @@ test("desktop watcher reads historical model and reasoning from the thread rollo
 
 test("interrupt waits until the Composer confirms response generation stopped", async () => {
   const controller = Object.create(CodexDesktopController.prototype);
-  let clickScript = "";
+  let clickExpression = "";
   let waitExpression = "";
   let keyPresses = 0;
   controller.ensureReady = async () => {};
-  controller.evaluate = async (source) => {
-    clickScript = source;
-    return { ok: true };
-  };
+  controller.clickElement = async (source) => { clickExpression = source; };
   controller.waitFor = async (condition, timeout, interval) => {
     waitExpression = condition;
     assert.ok(timeout > 0);
@@ -521,12 +518,12 @@ test("interrupt waits until the Composer confirms response generation stopped", 
 
   await controller.interrupt();
 
-  assert.match(clickScript, /data-codex-composer/);
-  assert.match(clickScript, /submitButtonMode/);
-  assert.match(clickScript, /isResponseInProgress/);
-  assert.match(clickScript, /facts\.mode !== 'stop'/);
-  assert.doesNotMatch(clickScript, /停止\|Stop|发送\|Send|排队\|队列\|Queue/);
-  assert.match(clickScript, /pointerdown/);
+  assert.match(clickExpression, /data-codex-composer/);
+  assert.match(clickExpression, /submitButtonMode/);
+  assert.match(clickExpression, /isResponseInProgress/);
+  assert.match(clickExpression, /facts\.mode !== 'stop'/);
+  assert.doesNotMatch(clickExpression, /停止\|Stop|发送\|Send|排队\|队列\|Queue/);
+  assert.doesNotMatch(clickExpression, /dispatchEvent|pointerdown/);
   assert.match(waitExpression, /response_in_progress !== true/);
   assert.match(waitExpression, /submitButtonMode/);
   assert.equal(keyPresses, 0);
@@ -535,7 +532,7 @@ test("interrupt waits until the Composer confirms response generation stopped", 
 test("interrupt fails explicitly when Codex has no visible Stop control", async () => {
   const controller = Object.create(CodexDesktopController.prototype);
   controller.ensureReady = async () => {};
-  controller.evaluate = async () => ({ ok: false, reason: "interrupt_control_unavailable" });
+  controller.clickElement = async () => { throw new Error("CDP target element not found"); };
   controller.waitFor = async () => {
     throw new Error("must not wait after a failed click");
   };
@@ -633,36 +630,36 @@ test("reasoning options use native efforts and lock state rather than ordinal pl
 
 test("interrupt clicks only the native Stop action when dictation shares the footer", async () => {
   const vm = require("node:vm");
-  const events = [];
-  const element = (name, navigation = false) => ({
+  const element = (navigation = false) => ({
     getBoundingClientRect: () => ({ width: 20, height: 20 }),
     getAttribute: () => null,
     hasAttribute: (key) => navigation && key === "data-composer-navigation-target",
-    matches: () => true,
+    matches: () => false,
     querySelectorAll: () => [],
-    focus: () => {},
-    dispatchEvent: (event) => { events.push([name, event.type]); },
   });
-  const stop = element("stop");
+  const stop = element();
   stop.__reactFiber$fixture = { memoizedProps: {
     isLoading: false, disabled: false, ariaLabel: "Stop", Icon: {}, onClick: () => {},
     submitButtonMode: "stop", isResponseInProgress: true, isQueueingEnabled: true, submitDisabled: false,
   } };
-  const dictation = element("dictation");
-  const permission = element("permission", true);
-  const composer = element("composer");
+  const dictation = element();
+  const permission = element(true);
+  const composer = element();
+  const input = element();
   composer.querySelectorAll = (selector) => selector === "[data-composer-navigation-target]"
-    ? [permission] : selector === 'button, [role="button"]' ? [dictation, permission, stop] : [];
+    ? [permission]
+    : selector === 'button, [role="button"]' ? [dictation, permission, stop]
+      : selector === 'textarea, input:not([type="hidden"]), [contenteditable="true"]' ? [input] : [];
   const controller = Object.create(CodexDesktopController.prototype);
   controller.ensureReady = async () => {};
-  controller.evaluate = async (source) => vm.runInNewContext(source, {
+  let clickedElement = null;
+  controller.clickElement = async (source) => {
+    clickedElement = vm.runInNewContext(source, {
     document: { querySelectorAll: (selector) => selector === ".composer-attachment-surface" ? [] : [composer] },
-    MouseEvent: class { constructor(type) { this.type = type; } },
-    PointerEvent: class { constructor(type) { this.type = type; } },
-  });
+    });
+    assert.equal(clickedElement, stop);
+  };
   controller.waitFor = async () => true;
   await controller.interrupt();
-  assert.equal(events.length, 5);
-  assert.ok(events.every(([name]) => name === "stop"));
-  assert.equal(events.at(-1)[1], "click");
+  assert.equal(clickedElement, stop);
 });
