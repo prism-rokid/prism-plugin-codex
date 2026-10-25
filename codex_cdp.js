@@ -20,6 +20,7 @@ const {
 } = requireCdpRuntime();
 
 const execFileAsync = promisify(execFile);
+const {questionOwnerSource, validateQuestionAnswers} = require("./question_surface");
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 15000;
 const DEFAULT_READY_TIMEOUT_MS = 15000;
@@ -34,6 +35,43 @@ const GOAL_EDIT_ICON_PREFIX = "M4.33496 11";
 const GOAL_PAUSE_ICON_PREFIX = "M10.625 7.91667";
 const GOAL_RESUME_ICON_PREFIX = "M7.96582 7.81836";
 const GOAL_CLEAR_ICON_PREFIX = "M10.6299 1.33496";
+
+// React props can retain DOM nodes, Window proxies and cyclic Fiber owners.
+// Inspect only own data properties of bounded plain-data containers: never run
+// accessors or walk a host object while resolving an exact project identity.
+function projectDataSearchSource() {
+  return `
+    const findOwnData = (root, match) => {
+      const seen = new WeakSet();
+      let remaining = 256;
+      const visit = (value, depth = 0) => {
+        if (!value || typeof value !== 'object' || depth > 10 || seen.has(value) || remaining-- <= 0) return '';
+        seen.add(value);
+        let descriptors;
+        try {
+          const prototype = Object.getPrototypeOf(value);
+          if (!Array.isArray(value) && prototype !== null && Object.getPrototypeOf(prototype) !== null) return '';
+          descriptors = Object.getOwnPropertyDescriptors(value);
+        } catch { return ''; }
+        const matched = match(descriptors);
+        if (matched) return matched;
+        for (const [key, descriptor] of Object.entries(descriptors)) {
+          if (['_owner', '_store', 'ref', 'stateNode', 'return'].includes(key) || !Object.hasOwn(descriptor, 'value')) continue;
+          const found = visit(descriptor.value, depth + 1);
+          if (found) return found;
+          if (remaining <= 0) break;
+        }
+        return '';
+      };
+      return visit(root);
+    };
+    const findExactProject = (root, requestedCwd, expectedProjectID = '') => findOwnData(root, (descriptors) => {
+      const projectID = descriptors.projectId?.value;
+      return descriptors.path?.value === requestedCwd && typeof projectID === 'string' && projectID.trim()
+        && (!expectedProjectID || projectID === expectedProjectID) ? projectID.trim() : '';
+    });
+  `;
+}
 
 function goalPlanDOMHelpersSource() {
   return `
@@ -518,7 +556,11 @@ function approvalDOMHelpersSource() {
     };
     const approvalActionHandler = (element) => {
       const props = approvalPropsFor(element);
-      return props && typeof props.onClick === 'function' ? props.onClick : null;
+      if (props && typeof props.onClick === 'function') return props.onClick;
+      const form = element && element.closest('form');
+      const type = (element && (element.getAttribute('type') || 'submit')).toLowerCase();
+      const formProps = form && approvalPropsFor(form);
+      return type === 'submit' && formProps && typeof formProps.onSubmit === 'function' ? formProps.onSubmit : null;
     };
     const approvalRegistry = (() => {
       const key = Symbol.for('prism.codex.approval-interactions.v1');
@@ -553,9 +595,10 @@ function approvalDOMHelpersSource() {
       return signatures.length === 1 ? groups.find((group) => group.signature === signatures[0])?.actions || null : null;
     };
     const findApprovalActionSurface = () => {
-      const candidates = [...document.querySelectorAll(approvalSurfaceSelector)].filter(visible);
+      const candidates = [...document.querySelectorAll(approvalSurfaceSelector + ', [role="dialog"], [role="alertdialog"]')].filter(visible);
       const matched = candidates.filter((surface) => Boolean(approvalActionGroup(surface)));
-      return matched.length === 1 ? matched[0] : null;
+      const signatures = new Set(matched.map((surface) => approvalActionGroup(surface).map(approvalActionHandler).map(approvalActionToken).join('|')));
+      return signatures.size === 1 && matched.length ? matched.sort((a, b) => textOf(a).length - textOf(b).length)[0] : null;
     };
     const findApprovalDialog = () => findApprovalActionSurface();
     const approvalActionElements = (dialog) => dialog ? (approvalActionGroup(dialog) || []) : [];
@@ -2527,28 +2570,12 @@ class CodexDesktopController extends CdpPageClient {
           fiber = fiberKey ? node[fiberKey] : null;
         }
         if (!fiber) return '';
-        const visited = new Set();
-        const findClientThreadID = (value, depth = 0) => {
-          if (depth > 5 || value === null || value === undefined) return '';
-          if (typeof value !== 'object' || visited.has(value)) return '';
-          visited.add(value);
-          if (typeof value.clientThreadId === 'string' && value.clientThreadId.trim()) {
-            return value.clientThreadId.trim();
-          }
-          if (Array.isArray(value)) {
-            for (const item of value.slice(0, 24)) {
-              const found = findClientThreadID(item, depth + 1);
-              if (found) return found;
-            }
-            return '';
-          }
-          for (const item of Object.values(value).slice(0, 80)) {
-            const found = findClientThreadID(item, depth + 1);
-            if (found) return found;
-          }
-          return '';
-        };
-        for (let index = 0; fiber && index < 24; index += 1, fiber = fiber.return) {
+        ${projectDataSearchSource()}
+        const findClientThreadID = (value) => findOwnData(value, (descriptors) => {
+          const id = descriptors.clientThreadId?.value;
+          return typeof id === 'string' ? id.trim() : '';
+        });
+        for (let index = 0; fiber && index < 64; index += 1, fiber = fiber.return) {
           const found = findClientThreadID(fiber.memoizedProps) || findClientThreadID(fiber.memoizedState);
           if (found) return found;
         }
@@ -2921,21 +2948,10 @@ class CodexDesktopController extends CdpPageClient {
     }
     const projectId = await this.evaluate(`(() => {
       const requestedCwd = ${JSON.stringify(normalizedCwd)};
-      const findProject = (value, seen = new WeakSet(), depth = 0) => {
-        if (!value || typeof value !== 'object' || depth > 10 || seen.has(value)) return null;
-        seen.add(value);
-        if (value.path === requestedCwd && typeof value.projectId === 'string' && value.projectId.trim()) {
-          return value.projectId.trim();
-        }
-        for (const child of Object.values(value)) {
-          const found = findProject(child, seen, depth + 1);
-          if (found) return found;
-        }
-        return null;
-      };
+      ${projectDataSearchSource()}
       for (const row of document.querySelectorAll('[data-app-action-sidebar-project-row]')) {
         const propsKey = Object.keys(row).find((key) => key.startsWith('__reactProps$'));
-        const projectId = propsKey ? findProject(row[propsKey]) : null;
+        const projectId = propsKey ? findExactProject(row[propsKey], requestedCwd) : null;
         if (projectId) return projectId;
       }
       return '';
@@ -3137,12 +3153,8 @@ class CodexDesktopController extends CdpPageClient {
         const key = element && Object.keys(element).find((name) => name.startsWith('__reactFiber$'));
         return key ? element[key] : null;
       };
-      const hasExactProject = (value, seen = new WeakSet(), depth = 0) => {
-        if (!value || typeof value !== 'object' || depth > 10 || seen.has(value)) return false;
-        seen.add(value);
-        if (value.projectId === expectedProjectID && value.path === requestedCwd) return true;
-        return Object.values(value).some((child) => hasExactProject(child, seen, depth + 1));
-      };
+      ${projectDataSearchSource()}
+      const hasExactProject = (value) => Boolean(findExactProject(value, requestedCwd, expectedProjectID));
       const isProjectNewThreadButton = (element) => {
         let projectMatched = false;
         let startActionMatched = false;
@@ -3154,7 +3166,9 @@ class CodexDesktopController extends CdpPageClient {
         }
         return projectMatched && startActionMatched;
       };
-      const candidates = [...document.querySelectorAll('button, [role="button"]')]
+      const projectRow = document.querySelector('[data-app-action-sidebar-project-id=' + JSON.stringify(expectedProjectID) + ']');
+      if (!projectRow) return null;
+      const candidates = [...projectRow.querySelectorAll('button, [role="button"]')]
         .filter(visible)
         .filter(enabled)
         // The project action menu and the new-thread action share the same
@@ -3736,11 +3750,69 @@ class CodexDesktopController extends CdpPageClient {
   }
 
   async readInteractiveSurface() {
+    const question = await this.readQuestionSurface();
+    if (question) {
+      const {_identity, ...surface} = question;
+      return surface;
+    }
     const raw = await this.readInteractiveSurfaceRaw();
     return raw ? this.publicInteractiveSurface(raw) : null;
   }
 
+  async readQuestionSurface() {
+    const raw = await this.evaluate(`(() => {
+      ${questionOwnerSource()}
+      const foreground = ${foregroundThreadIdExpression()};
+      return questionOwner && questionThreadId(questionOwner.conversationId) === foreground
+        ? {identity: questionIdentity(questionOwner), conversation_id: foreground, questions: questionOwner.rows} : null;
+    })()`);
+    if (!raw || typeof raw.identity !== "string" || !Array.isArray(raw.questions) || !raw.questions.length) return null;
+    const id = 'desktop-question:' + crypto.createHash('sha256').update(raw.identity).digest('hex');
+    return {surface_id: id, capability: 'user_question', kind: 'questionnaire', title: '问题',
+      description: '', questions: raw.questions.map((q, i) => ({...q, id: id + ':q:' + i})),
+      inputs: [], actions: [
+        {action_id: id + ':submit', label: '发送', purpose: 'submit_answers', available: true, accepts_input: true, requires_input: true},
+        {action_id: id + ':skip', label: '跳过', purpose: 'skip_questions', available: true, accepts_input: false, requires_input: false}
+      ], _identity: raw.identity};
+  }
+
+  async applyQuestionSurface(surfaceID, actionID, input) {
+    const current = await this.readQuestionSurface();
+    if (!current || current.surface_id !== surfaceID || !current.actions.some(a => a.action_id === actionID)) throw new Error('control_target_stale: question changed');
+    const drafts = validateQuestionAnswers(current.questions, input, actionID === surfaceID + ':skip');
+    const expectedDraft = drafts[0]?.freeformText || current.questions[0].options.find(o => o.id === drafts[0]?.selectedOptionId)?.label || '';
+    const outcome = await this.evaluate(`(async () => {
+      ${questionOwnerSource()}
+      if (!questionOwner || questionThreadId(questionOwner.conversationId) !== ${foregroundThreadIdExpression()} || questionIdentity(questionOwner) !== ${JSON.stringify(current._identity)}) return 'stale';
+      const key = Symbol.for('prism.codex.question-submissions.v1');
+      const seen = window[key] || (window[key] = new Set());
+      const identity = questionIdentity(questionOwner);
+      if (seen.has(identity)) return 'duplicate';
+      // Mark before invoking the native callback: a timeout is not permission
+      // to replay a question answer with an unknown late result.
+      seen.add(identity);
+      if (seen.size > 256) seen.delete(seen.values().next().value);
+      if (questionOwner.mode === 'async') {
+        if (${JSON.stringify(actionID === surfaceID + ':skip')}) { await questionOwner.skip(); return 'submitted'; }
+        const draft = ${JSON.stringify(drafts)}[0];
+        const text = draft.freeformText || questionOwner.rows[0].options.find(o => o.id === draft.selectedOptionId)?.label;
+        if (!text) { await questionOwner.skip(); return 'submitted'; }
+        questionOwner.panel.onDraftChange(text);
+        return 'drafted';
+      }
+      await questionOwner.submit(${JSON.stringify(drafts)});
+      return 'submitted';
+    })()`);
+    if (outcome === 'drafted') {
+      await this.waitFor(`(() => { ${questionOwnerSource()} return questionOwner && questionIdentity(questionOwner) === ${JSON.stringify(current._identity)} && questionOwner.panel?.questions[questionOwner.panel.questionIndex]?.draft === ${JSON.stringify(expectedDraft)}; })()`, 3000, 50);
+      const submitted = await this.evaluate(`(async () => { ${questionOwnerSource()} if (!questionOwner || questionIdentity(questionOwner) !== ${JSON.stringify(current._identity)}) return false; await questionOwner.submit(); return true; })()`);
+      if (!submitted) throw new Error('control_target_stale: question changed before submit');
+    } else if (outcome !== 'submitted') throw new Error('control_target_stale: question is stale or already submitted');
+    await this.waitFor(`(() => { ${questionOwnerSource()} return !questionOwner || questionIdentity(questionOwner) !== ${JSON.stringify(current._identity)}; })()`, 10000, 100);
+  }
+
   async applyInteractiveSurface(surfaceID, actionID, input = "") {
+    if (String(surfaceID).startsWith('desktop-question:')) return this.applyQuestionSurface(surfaceID, actionID, input);
     const raw = await this.readInteractiveSurfaceRaw();
     const surface = raw ? this.publicInteractiveSurface(raw) : null;
     const targetSurfaceID = String(surfaceID || "").trim();

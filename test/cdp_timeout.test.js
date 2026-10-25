@@ -119,6 +119,7 @@ test("composer submission reports a real confirmation surface instead of timing 
 
 test("interactive surface keeps the raw DOM target after desktop-only actions are filtered", async () => {
   const controller = Object.create(CodexDesktopController.prototype);
+  controller.readQuestionSurface = async () => null;
   const rawSurface = {
     role: "dialog",
     id: "permission-confirm",

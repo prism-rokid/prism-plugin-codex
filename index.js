@@ -797,6 +797,9 @@ function interactiveSurfaceForForeground(state, transition, threadID, surface) {
   }
   const surfaceID = String(surface && surface.surface_id || "").trim();
   if (!isThreadID(threadID)) return null;
+  // A native request-user-input renderer carries its own request lifecycle;
+  // it is not a permission dialog or a control-created confirmation.
+  if (surfaceID && surfaceCapability(surface) === "user_question" && surface.kind === "questionnaire") return surface;
   const expected = controlCreatedSurfaceByThread.get(threadID);
   const expectedSurfaceID = String(expected && expected.surfaceID || "").trim();
   const expectedCapability = String(expected && expected.capability || "").trim();

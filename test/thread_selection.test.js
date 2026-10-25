@@ -199,6 +199,8 @@ test("approval discovery supports Codex's inline approval surface", () => {
 
   assert.match(helpers, /data-codex-approval-surface/);
   assert.match(helpers, /findApprovalActionSurface/);
+  assert.match(helpers, /formProps\.onSubmit/);
+  assert.match(helpers, /approvalSurfaceSelector \+ ', \[role="dialog"\]/);
   assert.match(helpers, /approvalActionHandler/);
   assert.match(helpers, /prism\.codex\.approval-interactions\.v1/);
   assert.match(helpers, /approvalActionMatches/);
@@ -270,8 +272,8 @@ test("project creation resolves Codex's opaque project id from the exact cwd", a
     await controller.projectIdForCwd("/Users/xin.he/go/rokid-prism-hub"),
     "local-project-42",
   );
-  assert.match(script, /value\.path === requestedCwd/);
-  assert.match(script, /value\.projectId/);
+  assert.match(script, /descriptors\.path\?\.value === requestedCwd/);
+  assert.match(script, /descriptors\.projectId/);
   assert.doesNotMatch(script, /project-label|data-app-action-sidebar-project-label/);
 });
 
