@@ -49,7 +49,12 @@ Dashboard 插件页手动指定应用路径；原始 `PRISM_CODEX_APP_PATH` 仅�
 - `PRISM_CODEX_DEVTOOLS_FILE`
 - `PRISM_CODEX_APP_PATH`
 - `PRISM_CODEX_USER_DATA_DIR`
+- `PRISM_CODEX_HOME`（Windows 会话状态目录；与 Electron 用户数据目录不同）
 - `PRISM_PLUGIN_MANAGED_LAUNCH`
+
+Windows 默认从 `%USERPROFILE%\.codex` 读取会话状态，也接受 `CODEX_HOME` 或
+`PRISM_CODEX_HOME`。发布包包含 SQLite 读取组件；探测会先验证数据库可读。
+`PRISM_SQLITE3_BIN` 可作为内置组件不可用时的显式命令行兜底。
 
 Control-path notes:
 

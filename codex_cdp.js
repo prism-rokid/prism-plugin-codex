@@ -1374,10 +1374,11 @@ function defaultAppPath() {
     return fs.existsSync(standalone) ? standalone : chatgpt;
   }
   if (process.platform === "win32") {
-    return firstNonEmpty(
+    const candidates = [
       process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "Programs", "Codex", "Codex.exe") : "",
       process.env.ProgramFiles ? path.join(process.env.ProgramFiles, "Codex", "Codex.exe") : "",
-    );
+    ].filter(Boolean);
+    return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0] || "";
   }
   return "codex";
 }
@@ -1515,6 +1516,16 @@ async function listCodexProcesses() {
       .filter(Boolean);
   }
   if (process.platform === "win32") {
+    const modern = await commandOutput("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "Get-CimInstance Win32_Process -Filter \"Name='Codex.exe'\" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"], {
+      timeout: 8000,
+      maxBuffer: 2 * 1024 * 1024,
+    });
+    if (modern) {
+      try {
+        const parsed = JSON.parse(modern);
+        return (Array.isArray(parsed) ? parsed : [parsed]).map((row) => ({ pid: Number(row.ProcessId), command: firstNonEmpty(row.CommandLine) })).filter((row) => row.pid);
+      } catch {}
+    }
     const output = await commandOutput("cmd.exe", ["/c", "wmic process where \"name='Codex.exe'\" get ProcessId,CommandLine /format:list"], {
       timeout: 8000,
       maxBuffer: 2 * 1024 * 1024,
