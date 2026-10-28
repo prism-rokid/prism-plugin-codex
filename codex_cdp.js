@@ -41,7 +41,7 @@ function normalizeCwdForMatch(value) {
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 15000;
 const DEFAULT_READY_TIMEOUT_MS = 15000;
-const THREAD_SELECTION_TIMEOUT_MS = 4000;
+const THREAD_SELECTION_TIMEOUT_MS = process.platform === "win32" ? 9000 : 4000;
 
 // These vector prefixes are version-scoped Codex Desktop capabilities. They
 // are deliberately preferred over localized labels so a Chinese/English UI
@@ -3075,6 +3075,34 @@ class CodexDesktopController extends CdpPageClient {
     return { expanded: true, alreadyExpanded: !needsExpand };
   }
 
+  // Clicking the sidebar row keeps the workspace mounted (composer, model and
+  // approval controls), unlike the protocol deep link which activates the app
+  // through the OS handler and can leave the workspace without its composer.
+  async clickSidebarThreadRow(threadId) {
+    const normalized = String(threadId || "").trim();
+    if (!normalized) {
+      return false;
+    }
+    const rowScript = `(() => {
+      const target = ${JSON.stringify(normalized)};
+      const rows = [...document.querySelectorAll('[data-app-action-sidebar-thread-row]')];
+      const row = rows.find((el) => {
+        const value = el.getAttribute('data-app-action-sidebar-thread-id') || '';
+        return value === target || value.endsWith(':' + target);
+      });
+      if (!row) return null;
+      try { row.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch {}
+      return row;
+    })()`;
+    const visible = await this.evaluate(visibleElementScript(rowScript)).catch(() => false);
+    if (!visible) {
+      return false;
+    }
+    await this.clickDomElement(rowScript);
+    await sleep(160);
+    return true;
+  }
+
   async selectThread(threadId) {
     const normalized = String(threadId || "").trim();
     if (!normalized) {
@@ -3085,6 +3113,18 @@ class CodexDesktopController extends CdpPageClient {
       return { selected: true, alreadySelected: true };
     }
     const selectStartedAt = Date.now();
+    const clicked = await this.clickSidebarThreadRow(normalized).catch(() => false);
+    if (clicked) {
+      const clickedDeadline = Date.now() + THREAD_SELECTION_TIMEOUT_MS;
+      while (Date.now() < clickedDeadline) {
+        if (await this.isThreadSelected(normalized)) {
+          try { console.error(`[codex] selectThread costMs=${Date.now() - selectStartedAt} thread_id=${normalized} via=sidebar`); } catch {}
+          await sleep(120);
+          return { selected: true, alreadySelected: false };
+        }
+        await sleep(200);
+      }
+    }
     try {
       await this.openThreadByDeepLink(normalized, THREAD_SELECTION_TIMEOUT_MS);
     } catch (error) {
@@ -3110,17 +3150,19 @@ class CodexDesktopController extends CdpPageClient {
     const url = `codex://threads/${normalized}`;
     await new Promise((resolve, reject) => {
       const fail = (err) => reject(new Error(`deep link open failed: ${err.message}`));
+      // stdio stays detached: the URI handler and Codex Desktop must not inherit
+      // our pipes. On Windows `cmd /c start` never exits while the AppX
+      // activation runs, so use the URL handler entry point instead.
+      let child;
       if (process.platform === "win32") {
-        // Windows has no /usr/bin/open: `start` hands the URI to the registered
-        // codex:// protocol handler (the desktop app).
-        execFile("cmd.exe", ["/d", "/s", "/c", `start "" "${url}"`], { windowsHide: true }, (err) => (err ? fail(err) : resolve()));
-        return;
+        child = spawn("rundll32.exe", ["url.dll,FileProtocolHandler", url], { windowsHide: true, stdio: "ignore" });
+      } else if (process.platform === "linux") {
+        child = spawn("xdg-open", [url], { stdio: "ignore" });
+      } else {
+        child = spawn("/usr/bin/open", [url], { stdio: "ignore" });
       }
-      if (process.platform === "linux") {
-        execFile("xdg-open", [url], (err) => (err ? fail(err) : resolve()));
-        return;
-      }
-      execFile("/usr/bin/open", [url], (err) => (err ? fail(err) : resolve()));
+      child.once("error", fail);
+      child.once("exit", () => resolve());
     });
     const selectionTimeoutMs = Math.max(0, Number(timeoutMs) || THREAD_SELECTION_TIMEOUT_MS);
     const deadline = Date.now() + selectionTimeoutMs;
