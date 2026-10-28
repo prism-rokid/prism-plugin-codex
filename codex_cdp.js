@@ -4,7 +4,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
-const { spawn, execFile } = require("child_process");
+const { spawn, execFile, execFileSync } = require("child_process");
 const { promisify } = require("util");
 
 function requireCdpRuntime() {
@@ -1584,9 +1584,14 @@ function macProfileDir() {
   return path.join(os.homedir(), "Library", "Application Support", "Codex");
 }
 
-function windowsProfileDir() {
-  const appData = firstNonEmpty(process.env.APPDATA, process.env.LOCALAPPDATA);
-  return appData ? path.join(appData, "Codex") : path.join(os.homedir(), "AppData", "Roaming", "Codex");
+function windowsProfileDir(env = process.env, exists = fs.existsSync) {
+  const appData = firstNonEmpty(env.APPDATA, env.LOCALAPPDATA);
+  const root = appData ? path.join(appData, "Codex") : path.join(os.homedir(), "AppData", "Roaming", "Codex");
+  // The Microsoft Store build keeps its Chromium profile below web/Codex.
+  // Prefer it when present so the Plugin observes the same DevTools port as
+  // the Hub-managed Store executable; classic installs retain the old root.
+  const storeProfile = path.join(root, "web", "Codex");
+  return exists(storeProfile) ? storeProfile : root;
 }
 
 function linuxProfileDir() {
@@ -1607,10 +1612,14 @@ function defaultAppPath() {
     return fs.existsSync(standalone) ? standalone : chatgpt;
   }
   if (process.platform === "win32") {
-    return firstNonEmpty(
+    const classic = firstNonEmpty(
       process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "Programs", "Codex", "Codex.exe") : "",
       process.env.ProgramFiles ? path.join(process.env.ProgramFiles, "Codex", "Codex.exe") : "",
     );
+    if (classic && fs.existsSync(classic)) return classic;
+    try {
+      return String(execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "$pkg=Get-AppxPackage -Name OpenAI.Codex -ErrorAction SilentlyContinue; if($pkg){Join-Path $pkg.InstallLocation 'app\\ChatGPT.exe'}"], { encoding: "utf8", timeout: 5000, windowsHide: true }) || "").trim();
+    } catch { return classic; }
   }
   return "codex";
 }
@@ -4197,5 +4206,6 @@ module.exports = {
     reasoningEffortRowsFromFacts,
     EFFORT_CONTROL_ID,
     FLAT_INTELLIGENCE_MODEL_CONTROL_ID,
+    windowsProfileDir,
   },
 };

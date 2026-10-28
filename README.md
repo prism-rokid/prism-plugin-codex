@@ -24,7 +24,7 @@ Current behavior:
 Current limits:
 
 - full Codex Mini-style reliability is currently verified on macOS first
-- Windows / Linux still need real-machine validation for the CDP-only launch path
+- Windows Store/MSIX Codex uses `%APPDATA%\\Codex\\web\\Codex`; the Plugin detects that profile when it exists so Hub and Plugin use the same CDP port file. Windows still needs full desktop-control regression.
 - reverse sync includes plugin-wide directory events and foreground conversation snapshots; an unavailable foreground watcher is reported explicitly
 - approval event delivery / mobile-side lifecycle still needs further regression, but desktop-side resolve is now CDP-driven
 - if Codex is already running without a CDP port, the plugin will refuse to attach unless you close Codex and let Prism manage startup, configure `PRISM_CODEX_CDP_PORT` / `PRISM_CODEX_CDP_URL`, or enable managed relaunch
