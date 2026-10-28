@@ -4101,6 +4101,21 @@ function isReplaceableAnonymousDraft(runtime = {}) {
   );
 }
 
+// A remote draft open must recover from a leftover anonymous draft: an
+// interrupted remote send leaves its text in the composer and would otherwise
+// block every later attempt. Anonymous drafts have no durable thread identity,
+// so a readable, idle, usable composer may discard its text before the fresh
+// draft opens.
+function isDiscardableAnonymousDraft(runtime = {}) {
+  if (!runtime || isThreadID(firstNonEmpty(runtime.current_thread_id))) return false;
+  return Boolean(
+    anonymousDraftFingerprint(runtime)
+    && runtime.composer_available !== false
+    && runtime.running !== true
+    && runtime.waiting_approval !== true
+  );
+}
+
 async function waitForFreshCodexDraft(controller, previousRuntime = {}, timeoutMs = 2200) {
   const previousThreadID = firstNonEmpty(previousRuntime && previousRuntime.current_thread_id);
   if (isThreadID(previousThreadID)) {
@@ -4187,7 +4202,15 @@ async function openDraft(req) {
   const previous = await currentDesktopRuntimeSnapshot().catch(() => null);
   const previousThreadID = firstNonEmpty(previous && previous.current_thread_id);
   if (!isThreadID(previousThreadID) && !isReplaceableAnonymousDraft(previous)) {
-    throw new Error("codex cannot replace a non-empty or unreadable anonymous desktop draft");
+    // A leftover anonymous draft text (usually from an interrupted remote send)
+    // must not block the next remote draft: clear it when the composer is
+    // usable and the thread is idle, and keep failing closed otherwise.
+    if (!isDiscardableAnonymousDraft(previous)) {
+      throw new Error("codex cannot replace a non-empty or unreadable anonymous desktop draft");
+    }
+    console.warn("[codex] discarding anonymous desktop draft text before opening a remote draft");
+    await controller.clearComposer().catch(() => {});
+    await sleep(120);
   }
   await activateNewThread(cwd);
   try {

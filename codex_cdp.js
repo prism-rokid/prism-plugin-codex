@@ -3109,10 +3109,18 @@ class CodexDesktopController extends CdpPageClient {
     }
     const url = `codex://threads/${normalized}`;
     await new Promise((resolve, reject) => {
-      execFile("/usr/bin/open", [url], (err) => {
-        if (err) reject(new Error(`deep link open failed: ${err.message}`));
-        else resolve();
-      });
+      const fail = (err) => reject(new Error(`deep link open failed: ${err.message}`));
+      if (process.platform === "win32") {
+        // Windows has no /usr/bin/open: `start` hands the URI to the registered
+        // codex:// protocol handler (the desktop app).
+        execFile("cmd.exe", ["/d", "/s", "/c", `start "" "${url}"`], { windowsHide: true }, (err) => (err ? fail(err) : resolve()));
+        return;
+      }
+      if (process.platform === "linux") {
+        execFile("xdg-open", [url], (err) => (err ? fail(err) : resolve()));
+        return;
+      }
+      execFile("/usr/bin/open", [url], (err) => (err ? fail(err) : resolve()));
     });
     const selectionTimeoutMs = Math.max(0, Number(timeoutMs) || THREAD_SELECTION_TIMEOUT_MS);
     const deadline = Date.now() + selectionTimeoutMs;
