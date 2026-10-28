@@ -9,7 +9,7 @@ const path = require("path");
 const { execFile, spawn } = require("child_process");
 const { promisify } = require("util");
 const crypto = require("crypto");
-const { createCodexDesktopController, probeCodexMainPage } = require("./codex_cdp");
+const { createCodexDesktopController, normalizeCwdForMatch, probeCodexMainPage } = require("./codex_cdp");
 
 const execFileAsync = promisify(execFile);
 const CODEX_ROOT = process.platform === "win32"
@@ -968,7 +968,9 @@ function classifyThreadProject(cwd = "") {
 }
 
 function projectCwdOrEmpty(value = "") {
-  const cwd = validLocalDirectory(value);
+  // Codex thread rows can carry the Windows long-path prefix while the desktop
+  // sidebar keeps plain project paths; normalize before matching a project.
+  const cwd = validLocalDirectory(normalizeCwdForMatch(value));
   if (!cwd) return "";
   return classifyThreadProject(cwd).isProjectThread ? cwd : "";
 }

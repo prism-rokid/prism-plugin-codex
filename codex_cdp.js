@@ -22,6 +22,23 @@ const {
 const execFileAsync = promisify(execFile);
 const {questionOwnerSource, validateQuestionAnswers} = require("./question_surface");
 
+// Codex stores thread cwds with the Windows long-path prefix ("\\\\?\E:\...")
+// while the desktop UI keeps plain project paths. Strip the prefix before any
+// path comparison so a project opened from a remote client matches the sidebar
+// row; casing is preserved so the value can still be displayed and stored.
+function normalizeCwdForMatch(value) {
+  let text = String(value || "").trim();
+  if (process.platform === "win32") {
+    if (text.startsWith("\\\\?\\UNC\\")) {
+      text = "\\\\" + text.slice(8);
+    } else if (text.startsWith("\\\\?\\")) {
+      text = text.slice(4);
+    }
+    text = text.replace(/\//g, "\\").replace(/\\+$/, "");
+  }
+  return text;
+}
+
 const DEFAULT_CONNECT_TIMEOUT_MS = 15000;
 const DEFAULT_READY_TIMEOUT_MS = 15000;
 const THREAD_SELECTION_TIMEOUT_MS = 4000;
@@ -40,7 +57,25 @@ const GOAL_CLEAR_ICON_PREFIX = "M10.6299 1.33496";
 // Inspect only own data properties of bounded plain-data containers: never run
 // accessors or walk a host object while resolving an exact project identity.
 function projectDataSearchSource() {
+  const windows = process.platform === "win32";
   return `
+    const prismNormalizeProjectPath = (value) => {
+      let text = String(value || '').trim();
+      if (${windows ? "true" : "false"}) {
+        const bs = String.fromCharCode(92);
+        const longPathPrefix = bs + bs + '?' + bs;
+        const longUncPrefix = longPathPrefix + 'UNC' + bs;
+        if (text.startsWith(longUncPrefix)) {
+          text = bs + bs + text.slice(longUncPrefix.length);
+        } else if (text.startsWith(longPathPrefix)) {
+          text = text.slice(longPathPrefix.length);
+        }
+        text = text.split('/').join(bs);
+        while (text.length > 1 && text.endsWith(bs)) text = text.slice(0, -1);
+        text = text.toLowerCase();
+      }
+      return text;
+    };
     const findOwnData = (root, match) => {
       const seen = new WeakSet();
       let remaining = 256;
@@ -65,11 +100,25 @@ function projectDataSearchSource() {
       };
       return visit(root);
     };
-    const findExactProject = (root, requestedCwd, expectedProjectID = '') => findOwnData(root, (descriptors) => {
-      const projectID = descriptors.projectId?.value;
-      return descriptors.path?.value === requestedCwd && typeof projectID === 'string' && projectID.trim()
-        && (!expectedProjectID || projectID === expectedProjectID) ? projectID.trim() : '';
-    });
+    const findExactProject = (root, requestedCwd, expectedProjectID = '') => {
+      const exact = findOwnData(root, (descriptors) => {
+        const projectID = descriptors.projectId?.value;
+        return descriptors.path?.value === requestedCwd && typeof projectID === 'string' && projectID.trim()
+          && (!expectedProjectID || projectID === expectedProjectID) ? projectID.trim() : '';
+      });
+      if (exact) return exact;
+      // Fall back to a normalized comparison so Windows long-path cwds from the
+      // thread store still resolve the plain project path used by the desktop.
+      const requestedNormalized = prismNormalizeProjectPath(requestedCwd);
+      if (!requestedNormalized) return '';
+      return findOwnData(root, (descriptors) => {
+        const projectID = descriptors.projectId?.value;
+        return descriptors.path?.value !== undefined
+          && prismNormalizeProjectPath(descriptors.path?.value) === requestedNormalized
+          && typeof projectID === 'string' && projectID.trim()
+          && (!expectedProjectID || projectID === expectedProjectID) ? projectID.trim() : '';
+      });
+    };
   `;
 }
 
@@ -4202,6 +4251,7 @@ module.exports = {
   createCodexDesktopController,
   defaultProfileDir,
   isCodexMainPageTarget,
+  normalizeCwdForMatch,
   probeCodexMainPage,
   selectCodexMainPageTarget,
   __test: {
