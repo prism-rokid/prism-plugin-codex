@@ -1612,14 +1612,18 @@ function defaultAppPath() {
     return fs.existsSync(standalone) ? standalone : chatgpt;
   }
   if (process.platform === "win32") {
-    const classic = firstNonEmpty(
+    const candidates = [
       process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "Programs", "Codex", "Codex.exe") : "",
       process.env.ProgramFiles ? path.join(process.env.ProgramFiles, "Codex", "Codex.exe") : "",
-    );
-    if (classic && fs.existsSync(classic)) return classic;
+    ].filter(Boolean);
+    const classic = candidates.find((candidate) => fs.existsSync(candidate)) || "";
+    if (classic) return classic;
+    // No classic install: the Microsoft Store build hosts Codex inside ChatGPT.exe.
     try {
-      return String(execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "$pkg=Get-AppxPackage -Name OpenAI.Codex -ErrorAction SilentlyContinue; if($pkg){Join-Path $pkg.InstallLocation 'app\\ChatGPT.exe'}"], { encoding: "utf8", timeout: 5000, windowsHide: true }) || "").trim();
-    } catch { return classic; }
+      const storeApp = String(execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "$pkg=Get-AppxPackage -Name OpenAI.Codex -ErrorAction SilentlyContinue; if($pkg){Join-Path $pkg.InstallLocation 'app\\ChatGPT.exe'}"], { encoding: "utf8", timeout: 5000, windowsHide: true }) || "").trim();
+      if (storeApp) return storeApp;
+    } catch {}
+    return candidates[0] || "";
   }
   return "codex";
 }
@@ -1757,6 +1761,16 @@ async function listCodexProcesses() {
       .filter(Boolean);
   }
   if (process.platform === "win32") {
+    const modern = await commandOutput("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "Get-CimInstance Win32_Process -Filter \"Name='Codex.exe'\" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"], {
+      timeout: 8000,
+      maxBuffer: 2 * 1024 * 1024,
+    });
+    if (modern) {
+      try {
+        const parsed = JSON.parse(modern);
+        return (Array.isArray(parsed) ? parsed : [parsed]).map((row) => ({ pid: Number(row.ProcessId), command: firstNonEmpty(row.CommandLine) })).filter((row) => row.pid);
+      } catch {}
+    }
     const output = await commandOutput("cmd.exe", ["/c", "wmic process where \"name='Codex.exe'\" get ProcessId,CommandLine /format:list"], {
       timeout: 8000,
       maxBuffer: 2 * 1024 * 1024,

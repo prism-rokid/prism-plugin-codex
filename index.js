@@ -12,12 +12,15 @@ const crypto = require("crypto");
 const { createCodexDesktopController, probeCodexMainPage } = require("./codex_cdp");
 
 const execFileAsync = promisify(execFile);
-const SESSION_INDEX = path.join(os.homedir(), ".codex", "session_index.jsonl");
-const SESSION_ROOT = path.join(os.homedir(), ".codex", "sessions");
+const CODEX_ROOT = process.platform === "win32"
+  ? (process.env.PRISM_CODEX_HOME || process.env.CODEX_HOME || path.join(os.homedir(), ".codex"))
+  : path.join(os.homedir(), ".codex");
+const SESSION_INDEX = path.join(CODEX_ROOT, "session_index.jsonl");
+const SESSION_ROOT = path.join(CODEX_ROOT, "sessions");
 const PLUGIN_STATE_FILE = path.join(os.homedir(), ".prism", "codex.state.json");
 const STATE_DB_CANDIDATES = [
-  path.join(os.homedir(), ".codex", "state_5.sqlite"),
-  path.join(os.homedir(), ".codex", "sqlite", "state_5.sqlite"),
+  path.join(CODEX_ROOT, "state_5.sqlite"),
+  path.join(CODEX_ROOT, "sqlite", "state_5.sqlite"),
 ];
 const SQLITE3_BIN = process.env.PRISM_SQLITE3_BIN || "sqlite3";
 const VISIBILITY_TIMEOUT_MS = 8000;
@@ -86,6 +89,7 @@ const DESKTOP_WATCH_UNAVAILABLE_AFTER_POLLS = 3;
 let desktopWatchState = createDesktopWatchState();
 let desktopDirectoryState = createDesktopDirectoryState();
 let desktopDirectoryWatchers = [];
+let desktopDirectoryPollTimer = null;
 const DESKTOP_WATCH_BURST_DELAYS_MS = [0, 180, 500, 1100, 2200, 4500];
 const DESKTOP_WATCH_EVENT_QUEUE_MAX = 64;
 const DESKTOP_WATCH_TELEMETRY_INTERVAL_MS = 60 * 1000;
@@ -821,7 +825,7 @@ function interactiveSurfaceForForeground(state, transition, threadID, surface) {
 
 function readCodexConfigText() {
   try {
-    return fs.readFileSync(path.join(os.homedir(), ".codex", "config.toml"), "utf8");
+    return fs.readFileSync(path.join(CODEX_ROOT, "config.toml"), "utf8");
   } catch {
     return "";
   }
@@ -1118,7 +1122,13 @@ function codexInstalled() {
     return fs.existsSync("/Applications/Codex.app") || fs.existsSync("/Applications/ChatGPT.app");
   }
   if (process.platform === "win32") {
-    return Boolean(process.env.PRISM_CODEX_APP_PATH || process.env.PRISM_CODEX_WINDOW_TITLE);
+    const configured = String(process.env.PRISM_CODEX_APP_PATH || "").trim();
+    if (configured) return Boolean(safeStat(configured)?.isFile());
+    if (process.env.PRISM_CODEX_WINDOW_TITLE) return true;
+    return [
+      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "Programs", "Codex", "Codex.exe"),
+      process.env.ProgramFiles && path.join(process.env.ProgramFiles, "Codex", "Codex.exe"),
+    ].filter(Boolean).some((candidate) => safeStat(candidate)?.isFile());
   }
   if (process.platform === "linux") {
     return Boolean(process.env.PRISM_CODEX_APP_COMMAND || process.env.PRISM_CODEX_WINDOW_TITLE);
@@ -1155,6 +1165,10 @@ async function queryStateRows(sql) {
     if (!db) {
       return [];
     }
+    if (process.platform === "win32" && !process.env.PRISM_SQLITE3_BIN) {
+      try { return require("./windows_sqlite").readRows(db, sql, SQLITE_TIMEOUT_MS); }
+      catch { throw new Error("无法读取 Codex 会话数据库；请检查数据目录或重新安装插件。"); }
+    }
     const { stdout } = await execFileAsync(
       SQLITE3_BIN,
       ["-cmd", `.timeout ${SQLITE_TIMEOUT_MS}`, "-json", db, sql],
@@ -1178,6 +1192,10 @@ async function execStateSQL(sql) {
   const db = stateDBPath();
   if (!db) {
     throw new Error("Codex state database not found");
+  }
+  if (process.platform === "win32" && !process.env.PRISM_SQLITE3_BIN) {
+    try { require("./windows_sqlite").execute(db, sql, SQLITE_TIMEOUT_MS); return; }
+    catch { throw new Error("无法更新 Codex 会话数据库；请检查文件权限或重新安装插件。"); }
   }
   await execFileAsync(
     SQLITE3_BIN,
@@ -5683,13 +5701,29 @@ async function describeCodexControls(threadID = "", options = {}) {
 }
 
 async function capability() {
-  const localStateAvailable = codexInstalled() && (Boolean(stateDBPath()) || fs.existsSync(SESSION_INDEX));
+  const installed = codexInstalled();
+  const database = stateDBPath();
+  const sessionIndexExists = fs.existsSync(SESSION_INDEX);
+  let stateReason = "";
+  if (process.platform === "win32" && installed) {
+    if (!database && !sessionIndexExists) {
+      stateReason = "找不到 Codex 会话数据；请检查 CODEX_HOME。";
+    } else {
+      try {
+        if (database) await queryStateRows("SELECT 1 AS ready");
+        if (sessionIndexExists) fs.accessSync(SESSION_INDEX, fs.constants.R_OK);
+      } catch {
+        stateReason = "无法读取 Codex 会话数据；请检查 CODEX_HOME 或重新安装插件。";
+      }
+    }
+  }
+  const localStateAvailable = installed && (Boolean(database) || sessionIndexExists) && !stateReason;
   // Probe only the native CDP surface. Waiting for a visible workspace here
   // would block the 15s reverse-sync reconciliation that owns the watcher.
   const desktopControlAvailable = localStateAvailable && await probeCodexMainPage();
-  const unavailableReason = !localStateAvailable
-    ? "codex_desktop_or_state_db_unavailable"
-    : desktopControlAvailable ? "" : "codex_desktop_control_unavailable";
+  const unavailableReason = stateReason || (!localStateAvailable
+    ? process.platform === "win32" ? "找不到 Codex 桌面应用或会话数据；请检查应用路径和 CODEX_HOME。" : "codex_desktop_or_state_db_unavailable"
+    : desktopControlAvailable ? "" : process.platform === "win32" ? "无法连接 Codex Desktop；请启动桌面应用并检查 CDP 配置。" : "codex_desktop_control_unavailable");
   const available = localStateAvailable && desktopControlAvailable;
   return {
     PluginID: "codex",
@@ -5730,6 +5764,7 @@ async function discovery() {
     Verified: currentCapability.Available,
     Detail: currentCapability.Available
       ? "Codex Desktop CDP surface + local thread state available"
+      : process.platform === "win32" ? currentCapability.UnavailableReason
       : currentCapability.UnavailableReason === "codex_desktop_control_unavailable"
         ? "Codex Desktop control surface is not reachable through CDP"
         : "Codex Desktop or ~/.codex/state_5.sqlite not available",
@@ -6553,7 +6588,11 @@ function directoryWatchEventIsRelevant(directory, filename) {
 }
 
 function ensureDesktopDirectoryWatchRunning() {
-  if (desktopDirectoryWatchers.length > 0 || !hasPluginWideDesktopWatchSubscriber()) return;
+  if (!hasPluginWideDesktopWatchSubscriber()) return;
+  if (process.platform === "win32" && !desktopDirectoryPollTimer) {
+    desktopDirectoryPollTimer = setInterval(() => requestDesktopDirectoryRefresh({ immediate: true }), 10_000);
+  }
+  if (desktopDirectoryWatchers.length > 0) return;
   for (const directory of directoryWatchPaths()) {
     try {
       const recursive = directory === SESSION_ROOT && (process.platform === "darwin" || process.platform === "win32");
@@ -6575,6 +6614,8 @@ function ensureDesktopDirectoryWatchRunning() {
 
 function stopDesktopDirectoryWatchWhenIdle() {
   if (hasPluginWideDesktopWatchSubscriber()) return;
+  if (desktopDirectoryPollTimer) clearInterval(desktopDirectoryPollTimer);
+  desktopDirectoryPollTimer = null;
   for (const watcher of desktopDirectoryWatchers) watcher.close();
   desktopDirectoryWatchers = [];
   if (desktopDirectoryState.debounceTimer) clearTimeout(desktopDirectoryState.debounceTimer);
@@ -7209,5 +7250,6 @@ module.exports = {
     goalDetailFromRuntime,
     booleanControlTarget,
     objectiveControlTarget,
+    readCodexConfigText,
   },
 };
