@@ -36,6 +36,17 @@ test("deep-link selection does not require a title", async () => {
     },
   });
 
+  if (process.platform === "win32") {
+    // Windows switches through the sidebar row and never uses the protocol
+    // deep link, which can leave the workspace without its composer.
+    assert.deepEqual(await controller.selectThread(THREAD_ID), {
+      selected: false,
+      alreadySelected: false,
+      reason: "thread_row_not_visible",
+    });
+    assert.equal(selected, "");
+    return;
+  }
   assert.deepEqual(await controller.selectThread(THREAD_ID), { selected: true, alreadySelected: false });
   assert.equal(selected, THREAD_ID);
 });

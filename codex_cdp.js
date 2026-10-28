@@ -3103,7 +3103,7 @@ class CodexDesktopController extends CdpPageClient {
     return true;
   }
 
-  async selectThread(threadId) {
+  async selectThread(threadId, cwd = "") {
     const normalized = String(threadId || "").trim();
     if (!normalized) {
       throw new Error("Codex thread id required");
@@ -3113,7 +3113,23 @@ class CodexDesktopController extends CdpPageClient {
       return { selected: true, alreadySelected: true };
     }
     const selectStartedAt = Date.now();
-    const clicked = await this.clickSidebarThreadRow(normalized).catch(() => false);
+    // The sidebar row click is the Windows recovery path: the protocol deep
+    // link activates the app through the OS handler there and can leave the
+    // workspace without its composer. Other platforms keep the deep link.
+    let clicked = process.platform === "win32"
+      ? await this.clickSidebarThreadRow(normalized).catch(() => false)
+      : false;
+    if (!clicked && process.platform === "win32" && cwd) {
+      // Collapsed projects do not render their thread rows; expand the owning
+      // project before giving up on the in-page switch.
+      const projectId = await this.projectIdForCwd(normalizeCwdForMatch(cwd)).catch(() => "");
+      if (projectId) {
+        const expansion = await this.ensureProjectExpanded(projectId).catch(() => null);
+        if (expansion && expansion.expanded === true) {
+          clicked = await this.clickSidebarThreadRow(normalized).catch(() => false);
+        }
+      }
+    }
     if (clicked) {
       const clickedDeadline = Date.now() + THREAD_SELECTION_TIMEOUT_MS;
       while (Date.now() < clickedDeadline) {
@@ -3124,6 +3140,14 @@ class CodexDesktopController extends CdpPageClient {
         }
         await sleep(200);
       }
+    }
+    if (process.platform === "win32") {
+      // The protocol deep link activates Codex through the OS handler on
+      // Windows and can leave the workspace mounted without its composer, so
+      // never fall back to it there: report a normal control failure and let
+      // the caller retry instead of corrupting the desktop surface.
+      console.error(`[codex] selectThread incomplete thread_id=${normalized} reason=thread_row_not_visible`);
+      return { selected: false, alreadySelected: false, reason: "thread_row_not_visible" };
     }
     try {
       await this.openThreadByDeepLink(normalized, THREAD_SELECTION_TIMEOUT_MS);

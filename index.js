@@ -3882,7 +3882,14 @@ async function selectRequiredCodexThread(controller, threadID = "") {
   if (!controller || !isThreadID(threadID)) {
     throw new Error("control_target_stale: target conversation is unavailable");
   }
-  const selected = await controller.selectThread(threadID);
+  // The owning project cwd lets the Windows sidebar switch expand a collapsed
+  // project before clicking the thread row.
+  let cwd = "";
+  try {
+    const thread = await findThreadByID(threadID);
+    cwd = firstNonEmpty(thread && thread.cwd);
+  } catch {}
+  const selected = await controller.selectThread(threadID, cwd);
   if (!selected || selected.selected !== true || !await controller.isThreadSelected(threadID)) {
     throw new Error("control_target_stale: target conversation is not the current desktop conversation");
   }
@@ -4202,10 +4209,10 @@ async function openDraft(req) {
   const previous = await currentDesktopRuntimeSnapshot().catch(() => null);
   const previousThreadID = firstNonEmpty(previous && previous.current_thread_id);
   if (!isThreadID(previousThreadID) && !isReplaceableAnonymousDraft(previous)) {
-    // A leftover anonymous draft text (usually from an interrupted remote send)
-    // must not block the next remote draft: clear it when the composer is
-    // usable and the thread is idle, and keep failing closed otherwise.
-    if (!isDiscardableAnonymousDraft(previous)) {
+    // Windows only: a leftover anonymous draft text (usually from an
+    // interrupted remote send) must not block the next remote draft. Other
+    // platforms keep the strict fail-closed contract.
+    if (process.platform !== "win32" || !isDiscardableAnonymousDraft(previous)) {
       throw new Error("codex cannot replace a non-empty or unreadable anonymous desktop draft");
     }
     console.warn("[codex] discarding anonymous desktop draft text before opening a remote draft");
@@ -5110,10 +5117,18 @@ async function selectCodexConversation(threadID = "") {
   return runExclusiveDesktopControl(async () => {
     const controller = await codexDesktopController();
     const alreadySelected = await controller.isThreadSelected(threadID);
-    const selectResult = await controller.selectThread(threadID);
-    // selectThread reports that the deep link was dispatched. The only
-    // meaningful success condition for a remote control is that the Codex
-    // workspace has actually reached the requested thread.
+    // The owning project cwd lets the Windows sidebar switch expand a collapsed
+    // project before clicking the thread row.
+    let cwd = "";
+    try {
+      const thread = await findThreadByID(threadID);
+      cwd = firstNonEmpty(thread && thread.cwd);
+    } catch {}
+    const selectResult = await controller.selectThread(threadID, cwd);
+    // selectThread reports that a native switch was dispatched (a sidebar row
+    // click on Windows, the protocol deep link elsewhere). The only meaningful
+    // success condition for a remote control is that the Codex workspace has
+    // actually reached the requested thread.
     const selected = Boolean(selectResult && selectResult.selected !== false)
       && await controller.isThreadSelected(threadID);
     if (selected) {
