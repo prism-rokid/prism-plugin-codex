@@ -13,11 +13,11 @@ const { __test } = require("../index.js");
 const THREAD_ID = "11111111-1111-4111-8111-111111111111";
 
 test("Windows Store profile takes precedence when its Codex profile exists", () => {
-  const profile = cdpTest.windowsProfileDir(
-    { APPDATA: "C:\\Users\\test\\AppData\\Roaming" },
-    (candidate) => candidate.endsWith("Codex\\web\\Codex"),
-  );
-  assert.equal(profile, "C:\\Users\\test\\AppData\\Roaming\\Codex\\web\\Codex");
+  const path = require("node:path");
+  const root = path.join("fixture", "Roaming");
+  const expected = path.join(root, "Codex", "web", "Codex");
+  const profile = cdpTest.windowsProfileDir({ APPDATA: root }, (candidate) => candidate === expected);
+  assert.equal(profile, expected);
 });
 
 function selectionController(overrides = {}) {
