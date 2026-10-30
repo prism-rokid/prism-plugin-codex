@@ -22,9 +22,26 @@ const {
 const execFileAsync = promisify(execFile);
 const {questionOwnerSource, validateQuestionAnswers} = require("./question_surface");
 
+// Codex stores thread cwds with the Windows long-path prefix ("\\\\?\E:\...")
+// while the desktop UI keeps plain project paths. Strip the prefix before any
+// path comparison so a project opened from a remote client matches the sidebar
+// row; casing is preserved so the value can still be displayed and stored.
+function normalizeCwdForMatch(value) {
+  let text = String(value || "").trim();
+  if (process.platform === "win32") {
+    if (text.startsWith("\\\\?\\UNC\\")) {
+      text = "\\\\" + text.slice(8);
+    } else if (text.startsWith("\\\\?\\")) {
+      text = text.slice(4);
+    }
+    text = text.replace(/\//g, "\\").replace(/\\+$/, "");
+  }
+  return text;
+}
+
 const DEFAULT_CONNECT_TIMEOUT_MS = 15000;
 const DEFAULT_READY_TIMEOUT_MS = 15000;
-const THREAD_SELECTION_TIMEOUT_MS = 4000;
+const THREAD_SELECTION_TIMEOUT_MS = process.platform === "win32" ? 9000 : 4000;
 
 // These vector prefixes are version-scoped Codex Desktop capabilities. They
 // are deliberately preferred over localized labels so a Chinese/English UI
@@ -40,7 +57,25 @@ const GOAL_CLEAR_ICON_PREFIX = "M10.6299 1.33496";
 // Inspect only own data properties of bounded plain-data containers: never run
 // accessors or walk a host object while resolving an exact project identity.
 function projectDataSearchSource() {
+  const windows = process.platform === "win32";
   return `
+    const prismNormalizeProjectPath = (value) => {
+      let text = String(value || '').trim();
+      if (${windows ? "true" : "false"}) {
+        const bs = String.fromCharCode(92);
+        const longPathPrefix = bs + bs + '?' + bs;
+        const longUncPrefix = longPathPrefix + 'UNC' + bs;
+        if (text.startsWith(longUncPrefix)) {
+          text = bs + bs + text.slice(longUncPrefix.length);
+        } else if (text.startsWith(longPathPrefix)) {
+          text = text.slice(longPathPrefix.length);
+        }
+        text = text.split('/').join(bs);
+        while (text.length > 1 && text.endsWith(bs)) text = text.slice(0, -1);
+        text = text.toLowerCase();
+      }
+      return text;
+    };
     const findOwnData = (root, match) => {
       const seen = new WeakSet();
       let remaining = 256;
@@ -65,11 +100,25 @@ function projectDataSearchSource() {
       };
       return visit(root);
     };
-    const findExactProject = (root, requestedCwd, expectedProjectID = '') => findOwnData(root, (descriptors) => {
-      const projectID = descriptors.projectId?.value;
-      return descriptors.path?.value === requestedCwd && typeof projectID === 'string' && projectID.trim()
-        && (!expectedProjectID || projectID === expectedProjectID) ? projectID.trim() : '';
-    });
+    const findExactProject = (root, requestedCwd, expectedProjectID = '') => {
+      const exact = findOwnData(root, (descriptors) => {
+        const projectID = descriptors.projectId?.value;
+        return descriptors.path?.value === requestedCwd && typeof projectID === 'string' && projectID.trim()
+          && (!expectedProjectID || projectID === expectedProjectID) ? projectID.trim() : '';
+      });
+      if (exact) return exact;
+      // Fall back to a normalized comparison so Windows long-path cwds from the
+      // thread store still resolve the plain project path used by the desktop.
+      const requestedNormalized = prismNormalizeProjectPath(requestedCwd);
+      if (!requestedNormalized) return '';
+      return findOwnData(root, (descriptors) => {
+        const projectID = descriptors.projectId?.value;
+        return descriptors.path?.value !== undefined
+          && prismNormalizeProjectPath(descriptors.path?.value) === requestedNormalized
+          && typeof projectID === 'string' && projectID.trim()
+          && (!expectedProjectID || projectID === expectedProjectID) ? projectID.trim() : '';
+      });
+    };
   `;
 }
 
@@ -3026,7 +3075,35 @@ class CodexDesktopController extends CdpPageClient {
     return { expanded: true, alreadyExpanded: !needsExpand };
   }
 
-  async selectThread(threadId) {
+  // Clicking the sidebar row keeps the workspace mounted (composer, model and
+  // approval controls), unlike the protocol deep link which activates the app
+  // through the OS handler and can leave the workspace without its composer.
+  async clickSidebarThreadRow(threadId) {
+    const normalized = String(threadId || "").trim();
+    if (!normalized) {
+      return false;
+    }
+    const rowScript = `(() => {
+      const target = ${JSON.stringify(normalized)};
+      const rows = [...document.querySelectorAll('[data-app-action-sidebar-thread-row]')];
+      const row = rows.find((el) => {
+        const value = el.getAttribute('data-app-action-sidebar-thread-id') || '';
+        return value === target || value.endsWith(':' + target);
+      });
+      if (!row) return null;
+      try { row.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch {}
+      return row;
+    })()`;
+    const visible = await this.evaluate(visibleElementScript(rowScript)).catch(() => false);
+    if (!visible) {
+      return false;
+    }
+    await this.clickDomElement(rowScript);
+    await sleep(160);
+    return true;
+  }
+
+  async selectThread(threadId, cwd = "") {
     const normalized = String(threadId || "").trim();
     if (!normalized) {
       throw new Error("Codex thread id required");
@@ -3036,6 +3113,42 @@ class CodexDesktopController extends CdpPageClient {
       return { selected: true, alreadySelected: true };
     }
     const selectStartedAt = Date.now();
+    // The sidebar row click is the Windows recovery path: the protocol deep
+    // link activates the app through the OS handler there and can leave the
+    // workspace without its composer. Other platforms keep the deep link.
+    let clicked = process.platform === "win32"
+      ? await this.clickSidebarThreadRow(normalized).catch(() => false)
+      : false;
+    if (!clicked && process.platform === "win32" && cwd) {
+      // Collapsed projects do not render their thread rows; expand the owning
+      // project before giving up on the in-page switch.
+      const projectId = await this.projectIdForCwd(normalizeCwdForMatch(cwd)).catch(() => "");
+      if (projectId) {
+        const expansion = await this.ensureProjectExpanded(projectId).catch(() => null);
+        if (expansion && expansion.expanded === true) {
+          clicked = await this.clickSidebarThreadRow(normalized).catch(() => false);
+        }
+      }
+    }
+    if (clicked) {
+      const clickedDeadline = Date.now() + THREAD_SELECTION_TIMEOUT_MS;
+      while (Date.now() < clickedDeadline) {
+        if (await this.isThreadSelected(normalized)) {
+          try { console.error(`[codex] selectThread costMs=${Date.now() - selectStartedAt} thread_id=${normalized} via=sidebar`); } catch {}
+          await sleep(120);
+          return { selected: true, alreadySelected: false };
+        }
+        await sleep(200);
+      }
+    }
+    if (process.platform === "win32") {
+      // The protocol deep link activates Codex through the OS handler on
+      // Windows and can leave the workspace mounted without its composer, so
+      // never fall back to it there: report a normal control failure and let
+      // the caller retry instead of corrupting the desktop surface.
+      console.error(`[codex] selectThread incomplete thread_id=${normalized} reason=thread_row_not_visible`);
+      return { selected: false, alreadySelected: false, reason: "thread_row_not_visible" };
+    }
     try {
       await this.openThreadByDeepLink(normalized, THREAD_SELECTION_TIMEOUT_MS);
     } catch (error) {
@@ -3060,10 +3173,20 @@ class CodexDesktopController extends CdpPageClient {
     }
     const url = `codex://threads/${normalized}`;
     await new Promise((resolve, reject) => {
-      execFile("/usr/bin/open", [url], (err) => {
-        if (err) reject(new Error(`deep link open failed: ${err.message}`));
-        else resolve();
-      });
+      const fail = (err) => reject(new Error(`deep link open failed: ${err.message}`));
+      // stdio stays detached: the URI handler and Codex Desktop must not inherit
+      // our pipes. On Windows `cmd /c start` never exits while the AppX
+      // activation runs, so use the URL handler entry point instead.
+      let child;
+      if (process.platform === "win32") {
+        child = spawn("rundll32.exe", ["url.dll,FileProtocolHandler", url], { windowsHide: true, stdio: "ignore" });
+      } else if (process.platform === "linux") {
+        child = spawn("xdg-open", [url], { stdio: "ignore" });
+      } else {
+        child = spawn("/usr/bin/open", [url], { stdio: "ignore" });
+      }
+      child.once("error", fail);
+      child.once("exit", () => resolve());
     });
     const selectionTimeoutMs = Math.max(0, Number(timeoutMs) || THREAD_SELECTION_TIMEOUT_MS);
     const deadline = Date.now() + selectionTimeoutMs;
@@ -4202,6 +4325,7 @@ module.exports = {
   createCodexDesktopController,
   defaultProfileDir,
   isCodexMainPageTarget,
+  normalizeCwdForMatch,
   probeCodexMainPage,
   selectCodexMainPageTarget,
   __test: {
