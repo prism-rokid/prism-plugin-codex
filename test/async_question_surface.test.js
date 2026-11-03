@@ -16,4 +16,5 @@ function fixture(overrides={}) {
 test('async question uses native question identity and plain source text without invoking callbacks',()=>{
  const result=fixture();assert.equal(result.questions[0].question,'今晚想吃什么？');assert.equal(result.questions[0].options[1].label,'日料');assert.equal(result.conversation_id,'01a171ba-82ae-73f1-8cc9-d60273101704');
 });
-for(const overrides of [{hasSubmitted:true},{isSubmitting:true},{questionIndex:3},{questions:[{id:'other',question:'x',options:[]}]}])test('rejects stale or inactive async question '+JSON.stringify(overrides),()=>assert.equal(fixture(overrides),null));
+test('submitting remains a visible pending request until native completion',()=>assert.equal(fixture({isSubmitting:true}).submitting,true));
+for(const overrides of [{hasSubmitted:true},{questionIndex:3},{questions:[{id:'other',question:'x',options:[]}]}])test('rejects stale or inactive async question '+JSON.stringify(overrides),()=>assert.equal(fixture(overrides),null));

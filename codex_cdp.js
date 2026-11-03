@@ -3901,7 +3901,7 @@ class CodexDesktopController extends CdpPageClient {
   async readInteractiveSurface() {
     const question = await this.readQuestionSurface();
     if (question) {
-      const {_identity, ...surface} = question;
+      const {_identity, _conversationId, ...surface} = question;
       return surface;
     }
     const raw = await this.readInteractiveSurfaceRaw();
@@ -3910,54 +3910,63 @@ class CodexDesktopController extends CdpPageClient {
 
   async readQuestionSurface() {
     const raw = await this.evaluate(`(() => {
-      ${questionOwnerSource()}
+      ${questionOwnerSource(foregroundThreadIdExpression())}
       const foreground = ${foregroundThreadIdExpression()};
       return questionOwner && questionThreadId(questionOwner.conversationId) === foreground
-        ? {identity: questionIdentity(questionOwner), conversation_id: foreground, questions: questionOwner.rows} : null;
+        ? {identity: questionIdentity(questionOwner), conversation_id: foreground, questions: questionOwner.rows, submitting: questionOwner.panel?.isSubmitting === true, diagnostics: questionDiagnostics}
+        : {diagnostics: questionDiagnostics};
     })()`);
+    const diagnosticSignature = JSON.stringify(raw && raw.diagnostics || {reason:'unavailable'});
+    if (diagnosticSignature !== this._questionDiagnosticSignature) {
+      this._questionDiagnosticSignature = diagnosticSignature;
+      console.error('[codex] question.read ' + diagnosticSignature);
+    }
     if (!raw || typeof raw.identity !== "string" || !Array.isArray(raw.questions) || !raw.questions.length) return null;
     const id = 'desktop-question:' + crypto.createHash('sha256').update(raw.identity).digest('hex');
     return {surface_id: id, capability: 'user_question', kind: 'questionnaire', title: '问题',
       description: '', questions: raw.questions.map((q, i) => ({...q, id: id + ':q:' + i})),
       inputs: [], actions: [
-        {action_id: id + ':submit', label: '发送', purpose: 'submit_answers', available: true, accepts_input: true, requires_input: true},
-        {action_id: id + ':skip', label: '跳过', purpose: 'skip_questions', available: true, accepts_input: false, requires_input: false}
-      ], _identity: raw.identity};
+        {action_id: id + ':submit', label: '发送', purpose: 'submit_answers', available: raw.submitting !== true, accepts_input: true, requires_input: true},
+        {action_id: id + ':skip', label: '跳过', purpose: 'skip_questions', available: raw.submitting !== true, accepts_input: false, requires_input: false}
+      ], _identity: raw.identity, _conversationId: raw.conversation_id};
   }
 
   async applyQuestionSurface(surfaceID, actionID, input) {
     const current = await this.readQuestionSurface();
-    if (!current || current.surface_id !== surfaceID || !current.actions.some(a => a.action_id === actionID)) throw new Error('control_target_stale: question changed');
+    if (!current || current.surface_id !== surfaceID || !current.actions.some(a => a.action_id === actionID && a.available !== false)) throw new Error('control_target_stale: question changed or submitting');
     const drafts = validateQuestionAnswers(current.questions, input, actionID === surfaceID + ':skip');
-    const expectedDraft = drafts[0]?.freeformText || current.questions[0].options.find(o => o.id === drafts[0]?.selectedOptionId)?.label || '';
     const outcome = await this.evaluate(`(async () => {
-      ${questionOwnerSource()}
+      ${questionOwnerSource(foregroundThreadIdExpression())}
       if (!questionOwner || questionThreadId(questionOwner.conversationId) !== ${foregroundThreadIdExpression()} || questionIdentity(questionOwner) !== ${JSON.stringify(current._identity)}) return 'stale';
       const key = Symbol.for('prism.codex.question-submissions.v1');
       const seen = window[key] || (window[key] = new Set());
       const identity = questionIdentity(questionOwner);
       if (seen.has(identity)) return 'duplicate';
-      // Mark before invoking the native callback: a timeout is not permission
-      // to replay a question answer with an unknown late result.
-      seen.add(identity);
-      if (seen.size > 256) seen.delete(seen.values().next().value);
       if (questionOwner.mode === 'async') {
-        if (${JSON.stringify(actionID === surfaceID + ':skip')}) { await questionOwner.skip(); return 'submitted'; }
+        if (questionOwner.panel.isSubmitting) return 'duplicate';
+        if (${JSON.stringify(actionID === surfaceID + ':skip')}) { seen.add(identity); await questionOwner.skip(); return 'submitted'; }
         const draft = ${JSON.stringify(drafts)}[0];
         const text = draft.freeformText || questionOwner.rows[0].options.find(o => o.id === draft.selectedOptionId)?.label;
-        if (!text) { await questionOwner.skip(); return 'submitted'; }
-        questionOwner.panel.onDraftChange(text);
-        return 'drafted';
+        if (!text) { seen.add(identity); await questionOwner.skip(); return 'submitted'; }
+        // The native async handler reads its store at invocation. Updating
+        // the draft atom and calling that handler must stay in one evaluation;
+        // a render wait in between can lose the mounted question on navigation.
+        const panel = questionOwner.panel;
+        panel.onDraftChange(text);
+        seen.add(identity);
+        if (seen.size > 256) seen.delete(seen.values().next().value);
+        await panel.onSubmit();
+        return 'submitted';
       }
+      // Drafting has no send side effect. Reserve exactly once immediately
+      // before invoking the native submit callback, including on timeout.
+      seen.add(identity);
+      if (seen.size > 256) seen.delete(seen.values().next().value);
       await questionOwner.submit(${JSON.stringify(drafts)});
       return 'submitted';
     })()`);
-    if (outcome === 'drafted') {
-      await this.waitFor(`(() => { ${questionOwnerSource()} return questionOwner && questionIdentity(questionOwner) === ${JSON.stringify(current._identity)} && questionOwner.panel?.questions[questionOwner.panel.questionIndex]?.draft === ${JSON.stringify(expectedDraft)}; })()`, 3000, 50);
-      const submitted = await this.evaluate(`(async () => { ${questionOwnerSource()} if (!questionOwner || questionIdentity(questionOwner) !== ${JSON.stringify(current._identity)}) return false; await questionOwner.submit(); return true; })()`);
-      if (!submitted) throw new Error('control_target_stale: question changed before submit');
-    } else if (outcome !== 'submitted') throw new Error('control_target_stale: question is stale or already submitted');
-    await this.waitFor(`(() => { ${questionOwnerSource()} return !questionOwner || questionIdentity(questionOwner) !== ${JSON.stringify(current._identity)}; })()`, 10000, 100);
+    if (outcome !== 'submitted') throw new Error('control_target_stale: question is stale or already submitted');
+    await this.waitFor(`(() => { ${questionOwnerSource(foregroundThreadIdExpression())} return ${foregroundThreadIdExpression()} === ${JSON.stringify(current._conversationId)} && (!questionOwner || questionIdentity(questionOwner) !== ${JSON.stringify(current._identity)}); })()`, 10000, 100);
   }
 
   async applyInteractiveSurface(surfaceID, actionID, input = "") {
