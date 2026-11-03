@@ -9,7 +9,7 @@ const path = require("path");
 const { execFile, spawn } = require("child_process");
 const { promisify } = require("util");
 const crypto = require("crypto");
-const { createCodexDesktopController, normalizeCwdForMatch, probeCodexMainPage } = require("./codex_cdp");
+const { createCodexDesktopController, normalizeCwdForMatch, probeCodexMainPage, windowsCodexAppPath } = require("./codex_cdp");
 
 const execFileAsync = promisify(execFile);
 const CODEX_ROOT = process.platform === "win32"
@@ -1115,6 +1115,13 @@ async function queryDistinctThreadColumn(column) {
 
 let observedApprovalOptionsCache = { at: 0, items: [] };
 
+function windowsCodexInstalled(env = process.env, stat = safeStat, resolveAppPath = () => windowsCodexAppPath(env)) {
+  const configured = String(env.PRISM_CODEX_APP_PATH || "").trim();
+  if (configured) return Boolean(stat(configured)?.isFile());
+  if (Boolean(stat(resolveAppPath())?.isFile())) return true;
+  return Boolean(env.PRISM_CODEX_WINDOW_TITLE);
+}
+
 function codexInstalled() {
   if (process.platform === "darwin") {
     const configured = process.env.PRISM_CODEX_APP_PATH;
@@ -1124,13 +1131,7 @@ function codexInstalled() {
     return fs.existsSync("/Applications/Codex.app") || fs.existsSync("/Applications/ChatGPT.app");
   }
   if (process.platform === "win32") {
-    const configured = String(process.env.PRISM_CODEX_APP_PATH || "").trim();
-    if (configured) return Boolean(safeStat(configured)?.isFile());
-    if (process.env.PRISM_CODEX_WINDOW_TITLE) return true;
-    return [
-      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "Programs", "Codex", "Codex.exe"),
-      process.env.ProgramFiles && path.join(process.env.ProgramFiles, "Codex", "Codex.exe"),
-    ].filter(Boolean).some((candidate) => safeStat(candidate)?.isFile());
+    return windowsCodexInstalled();
   }
   if (process.platform === "linux") {
     return Boolean(process.env.PRISM_CODEX_APP_COMMAND || process.env.PRISM_CODEX_WINDOW_TITLE);
@@ -7291,5 +7292,6 @@ module.exports = {
     booleanControlTarget,
     objectiveControlTarget,
     readCodexConfigText,
+    windowsCodexInstalled,
   },
 };

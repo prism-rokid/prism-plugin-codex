@@ -1654,6 +1654,20 @@ function defaultProfileDir() {
   return linuxProfileDir();
 }
 
+function windowsCodexAppPath(env = process.env, exists = fs.existsSync, execute = execFileSync) {
+  const candidates = [
+    env.LOCALAPPDATA ? path.join(env.LOCALAPPDATA, "Programs", "Codex", "Codex.exe") : "",
+    env.ProgramFiles ? path.join(env.ProgramFiles, "Codex", "Codex.exe") : "",
+  ].filter(Boolean);
+  const classic = candidates.find((candidate) => exists(candidate)) || "";
+  if (classic) return classic;
+  try {
+    const storeApp = String(execute("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "$pkg=Get-AppxPackage -Name OpenAI.Codex -ErrorAction SilentlyContinue; if($pkg){Join-Path $pkg.InstallLocation 'app\\ChatGPT.exe'}"], { encoding: "utf8", timeout: 5000, windowsHide: true }) || "").trim();
+    if (storeApp) return storeApp;
+  } catch {}
+  return candidates[0] || "";
+}
+
 function defaultAppPath() {
   if (process.platform === "darwin") {
     const standalone = "/Applications/Codex.app/Contents/MacOS/Codex";
@@ -1661,18 +1675,7 @@ function defaultAppPath() {
     return fs.existsSync(standalone) ? standalone : chatgpt;
   }
   if (process.platform === "win32") {
-    const candidates = [
-      process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "Programs", "Codex", "Codex.exe") : "",
-      process.env.ProgramFiles ? path.join(process.env.ProgramFiles, "Codex", "Codex.exe") : "",
-    ].filter(Boolean);
-    const classic = candidates.find((candidate) => fs.existsSync(candidate)) || "";
-    if (classic) return classic;
-    // No classic install: the Microsoft Store build hosts Codex inside ChatGPT.exe.
-    try {
-      const storeApp = String(execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "$pkg=Get-AppxPackage -Name OpenAI.Codex -ErrorAction SilentlyContinue; if($pkg){Join-Path $pkg.InstallLocation 'app\\ChatGPT.exe'}"], { encoding: "utf8", timeout: 5000, windowsHide: true }) || "").trim();
-      if (storeApp) return storeApp;
-    } catch {}
-    return candidates[0] || "";
+    return windowsCodexAppPath();
   }
   return "codex";
 }
@@ -4324,6 +4327,7 @@ module.exports = {
   CodexDesktopController,
   createCodexDesktopController,
   defaultProfileDir,
+  windowsCodexAppPath,
   isCodexMainPageTarget,
   normalizeCwdForMatch,
   probeCodexMainPage,

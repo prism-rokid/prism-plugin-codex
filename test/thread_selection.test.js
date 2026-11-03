@@ -20,6 +20,17 @@ test("Windows Store profile takes precedence when its Codex profile exists", () 
   assert.equal(profile, expected);
 });
 
+test("Windows Store Codex application counts as installed without a manual override", () => {
+  const path = require("node:path");
+  const storeApp = path.join("fixture", "WindowsApps", "OpenAI.Codex", "app", "ChatGPT.exe");
+  const installed = __test.windowsCodexInstalled(
+    {},
+    (candidate) => candidate === storeApp ? { isFile: () => true } : null,
+    () => storeApp,
+  );
+  assert.equal(installed, true);
+});
+
 function selectionController(overrides = {}) {
   const controller = Object.create(CodexDesktopController.prototype);
   controller.ensureReady = async () => {};
