@@ -1,0 +1,6 @@
+interface:
+  display_name: "Prism 插件维护"
+  short_description: "本地分析并验证 Prism 插件修复，获授权后提交 PR 或问题 Issue"
+  default_prompt: "使用 $prism-plugin-maintainer 分析这个 Prism 插件问题，并在授权前准备可审阅的修复或 Issue 草稿。"
+policy:
+  allow_implicit_invocation: true
