@@ -3,7 +3,7 @@ const test = require('node:test');
 const vm = require('node:vm');
 const { CodexDesktopController } = require('../codex_cdp');
 
-function fixture(depth, mode = 'submit', queue = true, secondOwner = false) {
+function fixture(depth, mode = 'submit', queue = true, secondOwner = false, modern = false) {
   const events = [];
   const element = (text = '') => ({
     innerText: text,
@@ -14,8 +14,19 @@ function fixture(depth, mode = 'submit', queue = true, secondOwner = false) {
     querySelectorAll: () => [],
     dispatchEvent: event => { events.push([text, event.type]); },
   });
-  const owner = { submitButtonMode: mode, isResponseInProgress: mode === 'stop',
-    isQueueingEnabled: queue, submitDisabled: false };
+  const owner = modern
+    ? {
+      turn: {
+        serverInProgress: mode === 'stop',
+        hasMessageContent: true,
+        transitionBlocksSubmit: false,
+      },
+      submitDisabled: false,
+      isInteractionBlocked: false,
+      queuedFollowUpSubmission: queue ? {} : null,
+    }
+    : { submitButtonMode: mode, isResponseInProgress: mode === 'stop',
+      isQueueingEnabled: queue, submitDisabled: false };
   const primary = element('primary');
   primary.__reactFiber$fixture = { memoizedProps: {
     isLoading: false, disabled: false, ariaLabel: 'opaque', Icon: {}, onClick() {},
@@ -76,3 +87,13 @@ test('owner beyond the bounded search fails safely', async () => {
   const { controller } = fixture(80);
   await assert.rejects(controller.waitForComposerSendReady(1), /composer_action_owner_ambiguous/);
 });
+
+for (const [mode, queue, expected] of [['submit', true, 'send'], ['stop', true, 'queue']]) {
+  test(`Codex 26.1103 turn owner resolves ${expected} without legacy mode props`, async () => {
+    const f = fixture(32, mode, queue, false, true);
+    const facts = await f.controller.waitForComposerSendReady(100);
+    assert.equal(facts.submission_kind, expected);
+    await f.controller.clickComposerPrimaryButton(expected);
+    assert.equal(f.getClicked(), f.primary);
+  });
+}

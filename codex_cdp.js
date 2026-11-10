@@ -244,8 +244,9 @@ function goalComposerSubmitElementExpression() {
     };
     const isNativeSubmit = (element) => {
       let hasPrimaryContract = false;
-      let ownerCount = 0;
-      for (let current = fiberFor(element), depth = 0; current && depth < 16; current = current.return, depth += 1) {
+      let legacyOwnerCount = 0;
+      let modernOwnerCount = 0;
+      for (let current = fiberFor(element), depth = 0; current && depth < 64; current = current.return, depth += 1) {
         const props = current.memoizedProps;
         if (!props || typeof props !== 'object') continue;
         if (
@@ -260,9 +261,17 @@ function goalComposerSubmitElementExpression() {
           && typeof props.isResponseInProgress === 'boolean'
           && typeof props.isQueueingEnabled === 'boolean'
           && typeof props.submitDisabled === 'boolean'
-        ) ownerCount += 1;
+        ) legacyOwnerCount += 1;
+        const turn = props.turn;
+        if (
+          turn && typeof turn === 'object'
+          && typeof turn.serverInProgress === 'boolean'
+          && typeof turn.hasMessageContent === 'boolean'
+          && typeof turn.transitionBlocksSubmit === 'boolean'
+          && typeof props.submitDisabled === 'boolean'
+        ) modernOwnerCount += 1;
       }
-      return hasPrimaryContract && ownerCount === 1;
+      return hasPrimaryContract && (legacyOwnerCount === 1 || modernOwnerCount === 1);
     };
     const root = ${visibleDesktopElementExpression('[data-codex-composer-root]')};
     if (!visible(root)) return null;
@@ -374,18 +383,29 @@ function composerPrimaryActionElementExpression() {
     };
     const isComposerPrimaryAction = (element) => {
       if (!hasComposerPrimaryButtonContract(element)) return false;
-      let ownerCount = 0;
+      let legacyOwnerCount = 0;
+      let modernOwnerCount = 0;
       for (let current = fiberFor(element), depth = 0; current && depth < 64; current = current.return, depth += 1) {
         const props = current.memoizedProps;
+        if (!props || typeof props !== 'object') continue;
         if (
-          props && typeof props === 'object'
-          && typeof props.submitButtonMode === 'string'
+          typeof props.submitButtonMode === 'string'
           && typeof props.isResponseInProgress === 'boolean'
           && typeof props.isQueueingEnabled === 'boolean'
           && typeof props.submitDisabled === 'boolean'
-        ) ownerCount += 1;
+        ) legacyOwnerCount += 1;
+        const turn = props.turn;
+        if (
+          turn && typeof turn === 'object'
+          && typeof turn.serverInProgress === 'boolean'
+          && typeof turn.hasMessageContent === 'boolean'
+          && typeof turn.transitionBlocksSubmit === 'boolean'
+          && typeof props.submitDisabled === 'boolean'
+        ) modernOwnerCount += 1;
       }
-      return ownerCount === 1;
+      // Codex Desktop 26.1103 将 Composer 状态从旧的 mode/queue 属性移到了 turn 对象，必须匹配唯一完整契约。
+      return (legacyOwnerCount === 1 && modernOwnerCount === 0)
+        || (legacyOwnerCount === 0 && modernOwnerCount === 1);
     };
     for (let footer = composer; footer; footer = footer.parentElement) {
       if (footer.querySelectorAll('[data-composer-navigation-target]').length === 0) continue;
@@ -527,6 +547,12 @@ function composerPrimaryActionFactsSource() {
       for (const element of candidates) {
         if (!hasComposerPrimaryButtonContract(element)) continue;
         const owners = [];
+        let modernState = null;
+        let modernOwnerCount = 0;
+        let queueingEnabled = false;
+        let interactionBlocked = false;
+        let stopping = false;
+        let resumePending = false;
         for (let current = fiberFor(element), depth = 0; current && depth < 64; current = current.return, depth += 1) {
           const props = current.memoizedProps;
           if (!props || typeof props !== 'object') continue;
@@ -538,23 +564,45 @@ function composerPrimaryActionFactsSource() {
           ) {
             owners.push(props);
           }
+          const turn = props.turn;
+          if (
+            turn && typeof turn === 'object'
+            && typeof turn.serverInProgress === 'boolean'
+            && typeof turn.hasMessageContent === 'boolean'
+            && typeof turn.transitionBlocksSubmit === 'boolean'
+            && typeof props.submitDisabled === 'boolean'
+          ) {
+            modernOwnerCount += 1;
+            modernState = { turn, submitDisabled: props.submitDisabled };
+          }
+          if (props.queuedFollowUpSubmission && typeof props.queuedFollowUpSubmission === 'object') queueingEnabled = true;
+          if (props.isInteractionBlocked === true) interactionBlocked = true;
+          if (props.isStopping === true) stopping = true;
+          if (props.isResumePending === true) resumePending = true;
         }
-        if (owners.length === 1) actionCandidates.push({ element, owner: owners[0] });
+        if (owners.length === 1 && modernOwnerCount === 0) {
+          actionCandidates.push({ element, owner: owners[0], kind: 'legacy', queueingEnabled: owners[0].isQueueingEnabled === true, interactionBlocked: owners[0].isInteractionBlocked === true, stopping: owners[0].isStopping === true, resumePending: owners[0].isResumePending === true });
+        } else if (owners.length === 0 && modernOwnerCount === 1 && modernState) {
+          actionCandidates.push({ element, owner: modernState, kind: 'modern', queueingEnabled, interactionBlocked, stopping, resumePending });
+        }
       }
       if (actionCandidates.length !== 1) return { usable: false, reason: 'composer_action_owner_ambiguous' };
-      const { element, owner } = actionCandidates[0];
-      const mode = String(owner.submitButtonMode || '').trim().toLowerCase();
+      const { element, owner, kind } = actionCandidates[0];
+      const modern = kind === 'modern';
+      const mode = modern
+        ? (owner.turn.serverInProgress === true ? 'stop' : 'submit')
+        : String(owner.submitButtonMode || '').trim().toLowerCase();
       return {
         usable: Boolean(mode),
         enabled: enabled(element),
         mode,
-        response_in_progress: owner.isResponseInProgress === true,
-        queueing_enabled: owner.isQueueingEnabled === true,
-        submit_disabled: owner.submitDisabled === true,
-        stopping: owner.isStopping === true,
-        resume_pending: owner.isResumePending === true,
-        interaction_blocked: owner.isInteractionBlocked === true,
-        has_message_content: owner.hasMessageContent === true || hasNativePayload,
+        response_in_progress: modern ? owner.turn.serverInProgress === true : owner.isResponseInProgress === true,
+        queueing_enabled: modern ? actionCandidates[0].queueingEnabled : owner.isQueueingEnabled === true,
+        submit_disabled: modern ? owner.submitDisabled === true || owner.turn.transitionBlocksSubmit === true : owner.submitDisabled === true,
+        stopping: modern ? actionCandidates[0].stopping : owner.isStopping === true,
+        resume_pending: modern ? actionCandidates[0].resumePending : owner.isResumePending === true,
+        interaction_blocked: modern ? actionCandidates[0].interactionBlocked : owner.isInteractionBlocked === true,
+        has_message_content: modern ? owner.turn.hasMessageContent === true || hasNativePayload : owner.hasMessageContent === true || hasNativePayload,
       };
     };
   `;
