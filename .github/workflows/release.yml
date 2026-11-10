@@ -22,7 +22,7 @@ jobs:
       matrix:
         include:
           - target: macos-arm64
-            runner: macos-14
+            runner: macos-15
             # 自托管 runner 标签；仅在手动构建勾选 use_self_hosted 时使用。
             runner_labels: '["self-hosted","macOS","ARM64"]'
           - target: macos-x64
