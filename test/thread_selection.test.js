@@ -637,7 +637,7 @@ test("Composer and menu controls skip retained hidden duplicates", () => {
 test("flat model menu includes the native reasoning slider group", async () => {
   const controller = Object.create(CodexDesktopController.prototype);
   const modelRows = [{ optionId: "model", checked: true, label: "Model" }];
-  const effortRows = cdpTest.reasoningEffortRowsFromFacts({ total: 5, index: 1, label: "中" });
+  const effortRows = [{ optionId: `${cdpTest.EFFORT_CONTROL_ID}:native:high`, label: "High", checked: true, disabled: false }];
   let closed = false;
   controller.openIntelligenceMenu = async () => {};
   controller.intelligenceRootControls = async () => [];
@@ -648,16 +648,6 @@ test("flat model menu includes the native reasoning slider group", async () => {
   assert.equal(groups.length, 2);
   assert.deepEqual(groups[1], { control_id: cdpTest.EFFORT_CONTROL_ID, label: "推理强度", rows: effortRows });
   assert.equal(closed, true);
-});
-
-test("reasoning options use native efforts and lock state rather than ordinal placeholders", () => {
-  const rows = cdpTest.reasoningEffortRowsFromFacts({ total: 3, index: 0, label: "轻度", selections: [
-    { id: "model:low", model: "model", reasoningEffort: "low", disabled: false },
-    { id: "model:high", model: "model", reasoningEffort: "high", disabled: false },
-    { id: "model:ultra", model: "model", reasoningEffort: "ultra", disabled: true },
-  ] });
-  assert.deepEqual(rows.map(row => row.label), ["low", "high", "ultra"]);
-  assert.deepEqual(rows.map(row => row.disabled), [false, false, true]);
 });
 
 test("interrupt clicks only the native Stop action when dictation shares the footer", async () => {

@@ -4483,6 +4483,8 @@ function desktopRawLabel(value = "") {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
+const INTELLIGENCE_CONTROL_ID = "codex.intelligence";
+
 function dynamicInteractiveControl(controlID = "", displayLabel = "", currentValue = "", semanticKinds = []) {
   const normalizedControlID = String(controlID || "").trim();
   const normalizedDisplayLabel = desktopRawLabel(displayLabel);
@@ -4503,15 +4505,15 @@ function dynamicInteractiveControl(controlID = "", displayLabel = "", currentVal
   };
 }
 
-async function readCodexInteractiveControls(controller) {
+async function readCodexInteractiveControls(controller, threadID = "") {
   // This is watcher-safe: it reads only the already-rendered composer. A
   // missing or ambiguous root is omitted rather than recovered by opening a
   // menu, matching text, or preserving a stale cache entry.
-  const closed = await controller.closedComposerControls().catch(() => null);
+  const closed = await controller.closedComposerControls(threadID).catch(() => null);
   const controls = [];
   const intelligence = closed && closed.intelligence;
   // This is a product label only. The control itself is resolved exclusively
-  // through data-codex-intelligence-trigger and session-time ARIA ownership.
+  // through a native trigger within the current Composer.
   const intelligenceControl = dynamicInteractiveControl(
     intelligence && intelligence.controlId,
     "模型与推理",
@@ -4544,7 +4546,7 @@ function purgeExpiredMenuSessions() {
 // menu. It is never a public interactive-control owner.
 function isPublicInteractiveControlID(controlID = "") {
   const normalized = String(controlID || "").trim();
-  return normalized === "codex.intelligence" || normalized === "codex.permission";
+  return normalized === INTELLIGENCE_CONTROL_ID || normalized === "codex.permission";
 }
 
 function sameMenuOwner(left = null, right = null) {
@@ -4697,7 +4699,7 @@ async function describeCodexMenuSession(threadID = "", owner = null, options = {
       if (controlID === "codex.permission") {
         return { rows: await controller.listPermissionOptions(), groups: [] };
       }
-      if (controlID === "codex.intelligence") {
+      if (controlID === INTELLIGENCE_CONTROL_ID) {
         return { rows: [], groups: await controller.listIntelligenceMenuGroups() };
       }
       return { rows: await controller.listIntelligenceControlOptions(controlID), groups: [] };
@@ -4793,7 +4795,7 @@ async function applyCodexMenuSession(threadID = "", target = null, options = {})
     let interactiveControls = [];
     if (!draftID && session.owner && session.owner.kind === "interactive_control") {
       await sleep(180);
-      interactiveControls = await readCodexInteractiveControls(controller);
+      interactiveControls = await readCodexInteractiveControls(controller, threadID);
       rememberLiveControlOptions(threadID, { interactiveControls });
     }
     const details = {};
@@ -5057,7 +5059,7 @@ async function conversationDetailSnapshotFromDesktop(threadID = "", options = {}
     ? cachedOptions.interactiveControls
     : [];
   if (desktopForeground) {
-    interactiveControls = await readCodexInteractiveControls(controller);
+    interactiveControls = await readCodexInteractiveControls(controller, threadID);
     rememberLiveControlOptions(threadID, { interactiveControls });
   }
   const approval = currentRun && currentRun.approval && typeof currentRun.approval === "object"
@@ -5387,7 +5389,7 @@ async function readLiveComposerControls(threadID = "", controller = null, option
     }
     await sleep(Number.isFinite(options.settleMs) ? options.settleMs : 160);
   }
-  const current = await activeController.composerControlState().catch(() => null);
+  const current = await activeController.composerControlState(threadID).catch(() => null);
   if (!current || typeof current !== "object") {
     return null;
   }
@@ -5720,7 +5722,7 @@ async function describeCodexControls(threadID = "", options = {}) {
   const currentRuntime = controlsRuntimeFromDesktopSnapshot(threadID, runtimeSnapshot) || { status: "idle" };
   const runtimeStatus = String(currentRuntime.status || "").trim().toLowerCase();
   const controlsLocked = runtimeStatus === "waiting_approval";
-  const interactiveControls = await readCodexInteractiveControls(controller);
+  const interactiveControls = await readCodexInteractiveControls(controller, threadID);
   rememberLiveControlOptions(threadID, { interactiveControls });
   const pinned = await controller.threadPinned(threadID).catch(() => false);
   const actions = buildDetailActions(threadID, Boolean(pinned), controlsLocked);
@@ -6015,11 +6017,8 @@ function desktopWatchSignature(snapshot = {}, messagesSignature = "", interactiv
   return JSON.stringify(desktopWatchSignatureParts(snapshot, messagesSignature, interactiveSurface));
 }
 
-// A plugin-wide subscription drives the conversation index, not an open detail
-// page. Body, composer and dynamic-menu changes must not reorder or re-render
-// Mobile home while a Codex response is streaming. Queue changes are different:
-// their direct actions mutate the native composer, so they must publish a fresh
-// detail snapshot even when the coarse running status is unchanged.
+// 会话正文和输入框草稿不参与目录更新。模型与推理变化单独发布详情。
+// 队列的直接操作会改变 Composer，即使会话状态不变也要发布新快照。
 function desktopIndexWatchSignature(snapshot = {}, status = "") {
   const runtime = snapshot && snapshot.runtime && typeof snapshot.runtime === "object" ? snapshot.runtime : {};
   const threadID = firstNonEmpty(runtime.current_thread_id);
@@ -6408,7 +6407,7 @@ function desktopSessionHint(threadID, snapshot = {}, status = "") {
   };
 }
 
-function emitDesktopWatchDetail(subscriber, threadID, detailSnapshot, status, summary, sessionHint = null) {
+function emitDesktopWatchDetail(subscriber, threadID, detailSnapshot, status, summary, sessionHint = null, { includeSessionHint = true } = {}) {
   if (!subscriber || !isThreadID(threadID) || !detailSnapshot) return;
   subscriber.detailSnapshot = detailSnapshot;
   const hint = sessionHint && typeof sessionHint === "object"
@@ -6416,7 +6415,7 @@ function emitDesktopWatchDetail(subscriber, threadID, detailSnapshot, status, su
     : subscriber.sessionHint && typeof subscriber.sessionHint === "object"
       ? subscriber.sessionHint
       : desktopSessionHint(threadID, {}, status);
-  subscriber.sessionHint = hint;
+  if (includeSessionHint) subscriber.sessionHint = hint;
   emitDesktopWatchEvent(subscriber, {
     ID: `desktop-watch-${threadID}-${Date.now()}`,
     Type: "desktop.state.changed",
@@ -6435,7 +6434,7 @@ function emitDesktopWatchDetail(subscriber, threadID, detailSnapshot, status, su
         endpoint: deepLink(threadID),
         cwd: firstNonEmpty(hint.cwd),
       },
-      session_hint: hint,
+      ...(includeSessionHint ? { session_hint: hint } : {}),
     },
   });
 }
@@ -6810,7 +6809,7 @@ async function pollDesktopWatch() {
     // The watcher reads only the already-rendered composer. This keeps the
     // projection current without opening any Codex menu in the background.
     rememberLiveControlOptions(threadID, {
-      interactiveControls: await readCodexInteractiveControls(controller),
+      interactiveControls: await readCodexInteractiveControls(controller, threadID),
     });
     const status = desktopWatchStatus(runtime);
     const detailSignature = desktopWatchSignature(snapshot, messagesSignature, interactiveSurface);
@@ -6833,10 +6832,15 @@ async function pollDesktopWatch() {
       const trackedRollout = await resolveRolloutFile(threadID);
       desktopRunFileWatchStart(threadID, trackedRollout);
     }
+    const isIntelligenceControl = (control) => control.control_id === INTELLIGENCE_CONTROL_ID;
+    const intelligenceSignature = JSON.stringify(detailSnapshot.interactive_controls.find(isIntelligenceControl));
     for (const subscriber of desktopWatchSubscribers.values()) {
       if (!subscriber.pluginWide && subscriber.threadID !== threadID) continue;
       const signature = subscriber.pluginWide ? indexSignature : detailSignature;
-      if (!transition.recovered && !transition.switched && subscriber.signature === signature) continue;
+      const signatureChanged = transition.recovered || transition.switched || subscriber.signature !== signature;
+      const intelligenceChanged = subscriber.pluginWide &&
+        JSON.stringify(subscriber.detailSnapshot?.interactive_controls?.find(isIntelligenceControl)) !== intelligenceSignature;
+      if (!signatureChanged && !intelligenceChanged) continue;
       const messagesChanged = subscriber.messagesSignature !== messagesSignature;
       logDesktopWatchSignatureDrift(subscriber.signature, signature);
       subscriber.signature = signature;
@@ -6848,6 +6852,8 @@ async function pollDesktopWatch() {
         status,
         runtime.waiting_approval ? "Codex 正在等待审批。" : runtime.running ? "Codex 会话状态已更新。" : "Codex 会话设置已更新。",
         sessionHint,
+        // 单独变更模型与推理时，只刷新详情，避免 Hub 重新排列会话列表。
+        { includeSessionHint: signatureChanged },
       );
       if (messagesChanged) {
         logTiming("desktopWatch.messagesChanged", startedAt, {
@@ -6927,7 +6933,11 @@ function createDesktopWatchEventQueue(signal, options = {}) {
       if (coalesceKey) {
         const existingIndex = pending.findIndex((candidate) => desktopWatchEventCoalesceKey(candidate) === coalesceKey);
         if (existingIndex >= 0) {
-          pending[existingIndex] = event;
+          // 新的详情可以替换旧快照，但尚未送出的目录更新仍需传给 Hub。
+          const sessionHint = pending[existingIndex].Payload?.session_hint;
+          pending[existingIndex] = sessionHint && !event.Payload?.session_hint
+            ? { ...event, Payload: { ...event.Payload, session_hint: sessionHint } }
+            : event;
           recordDesktopWatchMetric("queue_events_coalesced");
           return;
         }

@@ -20,7 +20,7 @@ const {
 } = requireCdpRuntime();
 
 const execFileAsync = promisify(execFile);
-const {questionOwnerSource, validateQuestionAnswers} = require("./question_surface");
+const {committedFiberSource, questionOwnerSource, validateQuestionAnswers} = require("./question_surface");
 
 // Codex stores thread cwds with the Windows long-path prefix ("\\\\?\E:\...")
 // while the desktop UI keeps plain project paths. Strip the prefix before any
@@ -1183,21 +1183,14 @@ function intelligenceRootControlsExpression() {
       }
       return hash.toString(16).padStart(16, '0');
     };
-    const visible = (el) => {
-      const rect = el && el.getBoundingClientRect();
-      return Boolean(rect && rect.width > 0 && rect.height > 0);
-    };
-    const trigger = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
-    if (!trigger) return [];
+    ${intelligenceVisibilitySource()}
+    const owner = ${intelligenceMenuOwnerExpression()};
+    if (!owner) return [];
     const rootRows = (menu) => [...menu.querySelectorAll('[role]')]
       .filter((el) => el.closest('[role="menu"]') === menu)
       .filter((el) => ['menuitem', 'menuitemradio', 'menuitemcheckbox'].includes(String(el.getAttribute('role') || '').toLowerCase()))
       .filter((el) => el.getAttribute('aria-haspopup') === 'menu' && el.hasAttribute('aria-controls'));
-    const menus = [...document.querySelectorAll('[role="menu"]')].filter((menu) =>
-      visible(menu) && rootRows(menu).length > 0
-    );
-    if (menus.length !== 1) return [];
-    return rootRows(menus[0])
+    return rootRows(owner.menu)
       .filter(visible)
       .map((el) => {
         const text = String(el.getAttribute('aria-label') || el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
@@ -1220,20 +1213,10 @@ const FLAT_INTELLIGENCE_MODEL_CONTROL_ID = "codex.intelligence.flat-model";
 // menu, instead of exposing model/reasoning submenu roots with aria-controls.
 function flatIntelligenceMenuRowsExpression() {
   return `(() => {
-    const trigger = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
-    if (!trigger) return [];
-    const visible = (el) => {
-      const rect = el && el.getBoundingClientRect();
-      return Boolean(rect && rect.width > 0 && rect.height > 0);
-    };
-    const triggerID = String(trigger.id || '').trim();
-    const controlledMenuID = String(trigger.getAttribute('aria-controls') || '').trim();
-    const menus = [...document.querySelectorAll('[role="menu"]')].filter((menu) =>
-      visible(menu) && ((triggerID && String(menu.getAttribute('aria-labelledby') || '').trim() === triggerID) ||
-        (controlledMenuID && String(menu.id || '').trim() === controlledMenuID))
-    );
-    if (menus.length !== 1) return [];
-    const menu = menus[0];
+    const owner = ${intelligenceMenuOwnerExpression()};
+    if (!owner) return [];
+    ${intelligenceVisibilitySource()}
+    const { menu } = owner;
     const rows = [...menu.querySelectorAll('[role="menuitemradio"]')]
       .filter((el) => el.closest('[role="menu"]') === menu && visible(el));
     return rows.map((el, index) => {
@@ -1269,85 +1252,70 @@ function flatIntelligenceModelGroup(rows) {
   };
 }
 
-// The desktop intelligence menu renders effort selection as a slider row
-// (role=menuitem with data-reasoning-slider). Its thumb input mounts lazily,
-// but the row itself owns the ArrowLeft/ArrowRight keyboard control, and a
-// live region announces "<model> <level name>，第 N 项，共 M 项。" — the only
-// authoritative source for the current level, the level count, and the
-// localized name of the current level. Focusing the row is a prerequisite for
-// the trusted arrow-key presses dispatched by applyReasoningEffortIndex.
-function reasoningSliderFactsExpression() {
+// DOM 上的 React 宿主 props 随提交更新，保留的 Fiber 可能还指向旧选项。
+function reasoningSliderFactsExpression(focus = false) {
   return `(() => {
-    const row = ${visibleDesktopElementExpression('[data-reasoning-slider="true"]')};
-    if (!row) return null;
-    const rect = row.getBoundingClientRect();
-    if (!rect || rect.width <= 0 || rect.height <= 0) return null;
-    row.focus && row.focus();
-    const announcement = [...document.querySelectorAll('[role="status"]')]
-      .map((el) => String(el.textContent || '').replace(/\\s+/g, ' ').trim())
-      .filter(Boolean)
-      .find((text) => /第\\s*\\d+\\s*项/.test(text)) || '';
-    const match = announcement.match(/^(.*?)[，,]\\s*第\\s*(\\d+)\\s*项[，,]\\s*共\\s*(\\d+)\\s*项/) || null;
-    const prefixParts = match ? match[1].trim().split(/\\s+/).filter(Boolean) : [];
-    const trigger = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
-    let selections = [];
-    let selectedIndex = -1;
-    let hasNativeSelection = false;
-    let fiber = row[Object.keys(row).find((key) => key.startsWith('__reactFiber$'))];
-    for (let depth = 0; fiber && depth < 24; depth += 1, fiber = fiber.return) {
-      const props = fiber.memoizedProps;
-      if (!Array.isArray(props && props.powerSelections)) continue;
-      // The native selection identity works across locales and does not
-      // depend on asynchronous accessibility announcements.
-      const selectedID = props.selectedPowerSelection && props.selectedPowerSelection.id;
-      hasNativeSelection = selectedID != null;
-      selectedIndex = selectedID == null ? -1 : props.powerSelections.findIndex((selection) => selection.id === selectedID);
-      selections = props.powerSelections.map((selection) => ({
-        id: String(selection.id || ''),
-        model: String(selection.model || ''),
-        modelLabel: String(selection.modelLabel || ''),
-        reasoningEffort: String(selection.reasoningEffort || ''),
-        disabled: selection.isLocked === true || props.disabled === true,
-      }));
-      break;
+    const owner = ${intelligenceMenuOwnerExpression()};
+    if (!owner) return null;
+    const { menu, trigger } = owner;
+    ${intelligenceVisibilitySource()}
+    const rows = [...menu.querySelectorAll('[data-reasoning-slider="true"]')]
+      .filter((row) => row.closest('[role="menu"]') === menu && visible(row));
+    if (rows.length !== 1) return null;
+    const [row] = rows;
+    const own = (object, key) => object && typeof object === 'object'
+      ? Object.getOwnPropertyDescriptor(object, key)?.value : undefined;
+    const keys = Object.getOwnPropertyNames(row).filter((key) => key.startsWith('__reactProps$'));
+    if (keys.length !== 1) return null;
+    const host = own(row, keys[0]);
+    const marker = own(host, 'data-reasoning-slider');
+    if (marker !== true && marker !== 'true') return null;
+
+    // MenuItem 可以包裹内容组件。只沿已渲染的单一 children.props 链查找配置。
+    let props = host;
+    for (let depth = 0; props && depth < 6 && !Array.isArray(own(props, 'options')); depth += 1) {
+      props = own(own(props, 'children'), 'props');
     }
+    const options = own(props, 'options');
+    const selectedID = own(props, 'selectedOptionId');
+    if (!Array.isArray(options) || !options.length || options.length > 512 ||
+        typeof selectedID !== 'string' || !selectedID) return null;
+    const disabled = row.getAttribute('aria-disabled') === 'true' || row.hasAttribute('disabled') ||
+      own(host, 'disabled') === true || own(props, 'disabled') === true;
+    const ids = new Set();
+    const selections = [];
+    for (let index = 0; index < options.length; index += 1) {
+      const option = own(options, index);
+      const id = own(option, 'id');
+      const rawLabel = own(option, 'label');
+      const label = typeof rawLabel === 'string' ? rawLabel.replace(/\\s+/g, ' ').trim() : '';
+      const locked = own(option, 'isLocked');
+      if (typeof id !== 'string' || !id || id.trim() !== id || ids.has(id) || !label ||
+          (locked != null && typeof locked !== 'boolean')) return null;
+      ids.add(id);
+      selections.push({ id, label, disabled: disabled || locked === true });
+    }
+    const index = selections.findIndex((selection) => selection.id === selectedID);
+    if (index < 0) return null;
+    if (${focus} && !disabled) row.focus?.();
     return {
-      selections,
-      index: hasNativeSelection ? selectedIndex : match ? Math.max(0, Number(match[2]) - 1) : -1,
-      total: selections.length || (match ? Math.max(0, Number(match[3])) : 0),
-      label: prefixParts.length > 1 ? prefixParts[prefixParts.length - 1] : '',
-      announcement,
-      effortValue: trigger ? String(trigger.getAttribute('data-selected-reasoning-effort') || '').trim() : '',
+      selections, selectedID, index, focused: document.activeElement === row,
+      effortValue: String(trigger.getAttribute('data-selected-reasoning-effort') || '').trim(),
     };
   })()`;
 }
 
 const EFFORT_CONTROL_ID = "codex.intelligence.effort";
 
-// Prefer native power selections, with live-region facts for older Desktop builds.
 function reasoningEffortRowsFromFacts(facts) {
-  if (!facts || typeof facts !== "object") return [];
-  const total = Number(facts.total) || 0;
-  const index = Number(facts.index);
-  if (!total || !Number.isInteger(index) || index < 0 || index >= total) return [];
-  const currentLabel = String(facts.label || "").trim();
-  const selections = Array.isArray(facts.selections) && facts.selections.length === total
-    && facts.selections.every((selection) => selection && selection.id && selection.reasoningEffort)
-    ? facts.selections : null;
-  const mixedModels = selections && new Set(selections.map((selection) => selection.model)).size > 1;
-  const rows = [];
-  for (let level = 0; level < total; level += 1) {
-    rows.push({
-      index: level,
-      optionId: `${EFFORT_CONTROL_ID}:${level}`,
-      label: selections
-        ? (mixedModels ? `${selections[level].modelLabel || selections[level].model} · ${selections[level].reasoningEffort}` : selections[level].reasoningEffort)
-        : level === index && currentLabel ? currentLabel : `档位 ${level + 1}`,
-      checked: level === index,
-      disabled: selections ? selections[level].disabled === true : false,
-    });
-  }
-  return rows;
+  if (!Array.isArray(facts?.selections)) return [];
+  return facts.selections.map((selection, index) => ({
+    index,
+    optionId: `${EFFORT_CONTROL_ID}:${selection.id}`,
+    label: selection.label,
+    checked: selection.id === facts.selectedID,
+    disabled: selection.disabled,
+  }));
 }
 
 function intelligenceSubmenuRowsExpression(controlID) {
@@ -1361,10 +1329,7 @@ function intelligenceSubmenuRowsExpression(controlID) {
       }
       return hash.toString(16).padStart(16, '0');
     };
-    const visible = (el) => {
-      const rect = el && el.getBoundingClientRect();
-      return Boolean(rect && rect.width > 0 && rect.height > 0);
-    };
+    ${intelligenceVisibilitySource()}
     const isMenuRow = (el) => ['menuitem', 'menuitemradio', 'menuitemcheckbox', 'option']
       .includes(String(el && el.getAttribute('role') || '').toLowerCase());
     const isCurrent = (el) => {
@@ -1382,17 +1347,13 @@ function intelligenceSubmenuRowsExpression(controlID) {
         '[data-state="checked"], [data-state="selected"], [data-checked="true"], [data-selected="true"]'
       ));
     };
-    const trigger = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
-    if (!trigger) return [];
+    const owner = ${intelligenceMenuOwnerExpression()};
+    if (!owner) return [];
     const rootRows = (menu) => [...menu.querySelectorAll('[role]')]
       .filter((el) => el.closest('[role="menu"]') === menu)
       .filter((el) => ['menuitem', 'menuitemradio', 'menuitemcheckbox'].includes(String(el.getAttribute('role') || '').toLowerCase()))
       .filter((el) => el.getAttribute('aria-haspopup') === 'menu' && el.hasAttribute('aria-controls'));
-    const roots = [...document.querySelectorAll('[role="menu"]')].filter((menu) =>
-      visible(menu) && rootRows(menu).length > 0
-    );
-    if (roots.length !== 1) return [];
-    const controls = rootRows(roots[0])
+    const controls = rootRows(owner.menu)
       .filter(visible)
       .map((el) => ({
         el,
@@ -1448,24 +1409,280 @@ function intelligenceSubmenuRowsExpression(controlID) {
   })()`;
 }
 
+function intelligenceVisibilitySource() {
+  return `const visible = (element) => {
+    const rect = element && element.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0 || element.closest('[data-app-shell-active-page="false"], [aria-hidden="true"], [hidden], [inert]')) return false;
+    const visibility = getComputedStyle(element).visibility;
+    return visibility !== 'hidden' && visibility !== 'collapse';
+  };`;
+}
+
+// 控件读取只接受唯一、可见的当前 Composer 及其原生会话身份。
+function controlComposerOwnerExpression(expectedThreadId = "") {
+  return `(() => {
+    const rootSelector = '[data-codex-composer-root]';
+    const formSelector = 'form[data-thread-find-composer="true"]';
+    const legacySelector = '[data-codex-composer]';
+    const markerSelector = '[data-above-composer-conversation-id]';
+    ${intelligenceVisibilitySource()}
+    const areaOf = (element) => element.closest?.('[data-app-shell-focus-area]')?.getAttribute('data-app-shell-focus-area') || '';
+    const pageOf = (element) => element.closest?.('[data-app-shell-active-page="true"]') || null;
+    const ownerFor = (element) => {
+      const area = areaOf(element);
+      const page = pageOf(element);
+      return [formSelector, rootSelector, legacySelector].map((selector) => element.closest?.(selector))
+        .find((owner) => owner && areaOf(owner) === area && pageOf(owner) === page);
+    };
+    const candidates = [...document.querySelectorAll(rootSelector + ', ' + formSelector + ', ' + legacySelector)]
+      .filter(visible).map((element) => ownerFor(element) || element);
+    const owners = [...new Set(candidates)].filter((owner) => {
+      const area = areaOf(owner);
+      return visible(owner) && (!area || area === 'main');
+    });
+    const main = owners.filter((owner) => areaOf(owner) === 'main');
+    const scoped = main.length ? main : owners;
+    const active = scoped.filter(pageOf);
+    const matching = active.length ? active : scoped;
+    if (matching.length !== 1) return null;
+    const [owner] = matching;
+    const owns = (element) => element === owner || ownerFor(element) === owner;
+    const legacy = [...(owner.querySelectorAll?.(legacySelector) || [])].filter((element) => owns(element) && visible(element));
+    if (legacy.length > 1) return null;
+    const composer = legacy[0] || owner;
+
+    const normalizeId = (value) => {
+      const text = typeof value === 'string' ? value.trim() : '';
+      return text.match(/(?:^|:)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i)?.[1] || text;
+    };
+    const markerIds = [...new Set([...(owner.querySelectorAll?.(markerSelector) || [])]
+      .filter((marker) => owns(marker) && visible(marker.parentElement))
+      .map((marker) => normalizeId(marker.getAttribute('data-above-composer-conversation-id')))
+      .filter(Boolean))];
+    if (markerIds.length > 1) return null;
+    const [markerId = ''] = markerIds;
+
+    ${committedFiberSource()}
+    const fiberFor = (element) => {
+      const keys = Object.getOwnPropertyNames(element).filter((key) => key.startsWith('__reactFiber$'));
+      return keys.length === 1 ? reactFiber(reactOwn(element, keys[0])) : null;
+    };
+    const composerFiber = fiberFor(composer);
+    const nativeScope = () => {
+      for (let fiber = composerFiber, depth = 0; fiber && depth < 96;
+        fiber = reactFiber(reactOwn(fiber, 'return')), depth += 1) {
+        const props = reactOwn(fiber, 'memoizedProps');
+        const scope = reactOwn(props, 'scope');
+        // ScopeProvider exposes the branded ComposerScope in its own props.
+        // Descendant props and shared React state are not identity evidence.
+        if (reactOwn(scope, '__scopeBrand') === 'ComposerScope') return { value: reactOwn(props, 'value') };
+      }
+      return null;
+    };
+    const scope = nativeScope();
+    let threadId = markerId;
+    let clientThreadId = '';
+    if (scope && reactOwn(scope.value, 'kind') === 'local') {
+      const value = scope.value;
+      const conversation = reactOwn(value, 'conversationId');
+      const route = reactOwn(value, 'routeConversationId');
+      const client = reactOwn(value, 'clientThreadId');
+      if (reactOwn(value, 'placement') !== 'main' || typeof client !== 'string' || !client.trim()) return null;
+      if (conversation === null && route === null && !markerId) {
+        clientThreadId = client.trim();
+      } else {
+        threadId = normalizeId(conversation);
+        if (!threadId || normalizeId(route) !== threadId || (markerId && markerId !== threadId)) return null;
+      }
+    } else if (scope) {
+      return null;
+    }
+
+    const expected = ${JSON.stringify(expectedThreadId)};
+    if (expected && threadId !== expected) return null;
+    if (!scope && !threadId) {
+      // 旧版草稿把 clientThreadId 放在 Composer 自身的 props 或 state 中。
+      // 只使用已选 Composer 和容器的局部数据，不从祖先或子树借用指纹。
+      const ids = new Set();
+      for (const fiber of [composerFiber, owner === composer ? null : fiberFor(owner)]) {
+        for (const field of ['memoizedProps', 'memoizedState']) {
+          const client = reactOwn(reactOwn(fiber, field), 'clientThreadId');
+          if (typeof client === 'string' && client.trim()) ids.add(client.trim());
+        }
+      }
+      if (ids.size === 1) [clientThreadId] = ids;
+    }
+    if (!threadId && !clientThreadId) return null;
+    return { owner, threadId, owns };
+  })()`;
+}
+
+// 加载失败时的重试按钮也使用 reasoning 导航名，但没有已选档位属性。
+function intelligenceTriggerResolutionExpression(foregroundSource = "foreground") {
+  return `(() => {
+    const current = ${foregroundSource};
+    if (!current) return { trigger: null, reason: 'foreground_changed' };
+    ${intelligenceVisibilitySource()}
+    const matching = [...current.owner.querySelectorAll(
+      '[data-composer-navigation-target="reasoning"][data-selected-reasoning-effort], [data-codex-intelligence-trigger="true"]'
+    )].filter((trigger) => current.owns(trigger) && visible(trigger));
+    if (matching.length !== 1) return { trigger: null, reason: matching.length ? 'trigger_ambiguous' : 'trigger_missing' };
+    const [trigger] = matching;
+    const disabled = Boolean(trigger.disabled || trigger.closest('[aria-disabled="true"], [data-disabled]'));
+    return { trigger, disabled, reason: '' };
+  })()`;
+}
+
+function intelligenceMenuOwnerExpression() {
+  return `(() => {
+    const { trigger } = ${intelligenceTriggerResolutionExpression(controlComposerOwnerExpression())};
+    if (!trigger || trigger.getAttribute('aria-expanded') !== 'true') return null;
+    const triggerID = String(trigger.id || '').trim();
+    const controlledMenuID = String(trigger.getAttribute('aria-controls') || '').trim();
+    ${intelligenceVisibilitySource()}
+    const menus = [...document.querySelectorAll('[role="menu"]')].filter((menu) =>
+      visible(menu) && ((triggerID && String(menu.getAttribute('aria-labelledby') || '').trim() === triggerID) ||
+        (controlledMenuID && String(menu.id || '').trim() === controlledMenuID))
+    );
+    return menus.length === 1 ? { trigger, menu: menus[0] } : null;
+  })()`;
+}
+
+function ownReactDataSource() {
+  return `
+    ${committedFiberSource()}
+    // 只读取组件契约明确的自有数据属性，不执行 getter。
+    const data = (object, key) => {
+      if (!object || typeof object !== 'object') return undefined;
+      try {
+        const prototype = Object.getPrototypeOf(object);
+        if (prototype && Object.getPrototypeOf(prototype) !== null) return undefined;
+        return reactOwn(object, key);
+      } catch {
+        return undefined;
+      }
+    };
+    const fiberFor = (element) => {
+      const keys = Object.getOwnPropertyNames(element).filter((key) => key.startsWith('__reactFiber$'));
+      return keys.length === 1 ? reactFiber(reactOwn(element, keys[0])) : null;
+    };
+  `;
+}
+
+function nativeIntelligenceSelectionSource() {
+  return `
+    ${ownReactDataSource()}
+    const normalize = (value) => typeof value === 'string' ? value.replace(/\\s+/g, ' ').trim() : '';
+    const catalogLabel = (list, modelID, nested = false) => {
+      if (!Array.isArray(list)) return '';
+      const count = reactOwn(list, 'length');
+      if (!Number.isInteger(count) || count > 512) return '';
+      const labels = new Set();
+      for (let index = 0; index < count; index += 1) {
+        const item = reactOwn(list, index);
+        const model = nested ? data(item, 'model') : item;
+        if (data(model, 'model') === modelID) {
+          const label = normalize(data(model, 'displayName'));
+          if (label) labels.add(label);
+        }
+      }
+      return labels.size === 1 ? [...labels][0] : '';
+    };
+    const nativeSelection = (trigger, effortValue) => {
+      if (!effortValue || trigger.getAttribute('data-composer-navigation-target') !== 'reasoning') return null;
+      const open = trigger.getAttribute('aria-expanded') === 'true';
+      const matches = [];
+      let fiber = fiberFor(trigger);
+      for (let depth = 0; fiber && depth < 64; depth += 1, fiber = reactFiber(reactOwn(fiber, 'return'))) {
+        const props = reactOwn(fiber, 'memoizedProps');
+        // 新版触发组件持有当前选择；菜单展开后的可见文案可能是占位符。
+        const candidate = data(props, 'selectedLabelCandidate');
+        const candidateModel = normalize(data(candidate, 'model'));
+        if (candidateModel && data(candidate, 'reasoningEffort') === effortValue &&
+          data(props, 'isOpen') === open && typeof data(props, 'showOpenLabel') === 'boolean') {
+          matches.push(normalize(data(candidate, 'modelLabel')) || candidateModel);
+        }
+        // 另一版把按钮作为 tooltip 子元素交给 ModelPickerMenu。隐藏标签时
+        // 菜单仍持有真实选中模型及其原生显示名。
+        const model = normalize(data(props, 'model'));
+        if (!model || data(props, 'reasoningEffort') !== effortValue || data(props, 'open') !== open ||
+          !Array.isArray(data(props, 'powerSelections'))) continue;
+        const button = data(props, 'triggerButton');
+        const buttonProps = data(data(data(button, 'props'), 'children'), 'props');
+        if (data(buttonProps, 'data-composer-navigation-target') !== 'reasoning' ||
+          data(buttonProps, 'data-selected-reasoning-effort') !== effortValue) continue;
+        const models = data(props, 'models');
+        const options = data(props, 'modelOptions');
+        if (!Array.isArray(models) && !Array.isArray(options)) continue;
+        matches.push(catalogLabel(models, model) || catalogLabel(options, model, true) ||
+          normalize(data(props, 'fallbackModelLabel')) || model);
+      }
+      return matches.length === 1 ? matches[0] : null;
+    };
+  `;
+}
+
+function closedIntelligenceValueExpression() {
+  return `(() => {
+    const { trigger, reason } = ${intelligenceTriggerResolutionExpression()};
+    if (!trigger) return { reason };
+    const textOf = (element) => String(element && element.textContent || '').replace(/\\s+/g, ' ').trim();
+    const copy = trigger.cloneNode(true);
+    copy.querySelectorAll('[aria-hidden="true"], [hidden], [inert]').forEach((node) => node.remove());
+    const effortValue = String(trigger.getAttribute('data-selected-reasoning-effort') || '').trim();
+    const descriptionIDs = String(trigger.getAttribute('aria-describedby') || '').trim().split(/\\s+/);
+    const modern = trigger.getAttribute('data-composer-navigation-target') === 'reasoning' &&
+      trigger.hasAttribute('data-selected-reasoning-effort');
+    // 展开后的按钮可呈现菜单占位。该状态直接读同一个原生 owner 的选择。
+    const useSelection = modern && trigger.getAttribute('aria-expanded') === 'true';
+    // 紧凑布局的原生描述可包含没有包装元素的推理档位文本。
+    if (!useSelection && modern) {
+      const labels = [...copy.querySelectorAll('[id]')].filter((node) => descriptionIDs.includes(node.id))
+        .map((node) => {
+          const currentValue = textOf(node);
+          const model = textOf(node.querySelector('span'));
+          const effort = model && currentValue.startsWith(model) ? currentValue.slice(model.length).trim() : '';
+          return { currentValue, model, effort };
+        }).filter((entry) => entry.effort);
+      if (labels.length === 1) return { controlId: 'codex.intelligence', ...labels[0], effortValue, reason: '' };
+    }
+    const parts = [...copy.querySelectorAll('span')]
+      .filter((node) => node.children.length === 0)
+      .map(textOf)
+      .filter(Boolean);
+    const stacked = trigger.hasAttribute('data-selected-reasoning-effort') || trigger.querySelector('[data-reasoning-effort]');
+    const root = copy.querySelector(':scope > div') || copy;
+    const legacyValue = [...root.children].filter((node) => node.tagName === 'SPAN').map(textOf).filter(Boolean).at(-1);
+    const rendered = useSelection ? '' : (stacked ? parts.join(' ') : legacyValue) || textOf(copy);
+    let model = stacked && rendered ? parts[0] || '' : '';
+    let effort = stacked && rendered && parts.length > 1 ? parts[parts.length - 1] : '';
+    let currentValue = rendered;
+    if (!currentValue) {
+      ${nativeIntelligenceSelectionSource()}
+      model = nativeSelection(trigger, effortValue) || '';
+      if (model) {
+        effort = effortValue;
+        currentValue = model + ' ' + effort;
+      }
+    }
+    return { controlId: 'codex.intelligence', currentValue, model, effort, effortValue, reason: currentValue ? '' : 'value_unavailable' };
+  })()`;
+}
+
 // The closed composer is the only surface a watcher may read. Codex renders a
 // stable intelligence trigger with one combined value, but no independently
 // addressable model/reasoning roots. Publish it as one control and require an
 // explicit menu session to discover the real nested groups. Permission exposes
 // its stable navigation target as the raw display label because Codex renders
 // only the current value in the button.
-function closedComposerControlsExpression() {
+function closedComposerControlsExpression(expectedThreadId = "") {
   return `(() => {
+    const foreground = ${controlComposerOwnerExpression(expectedThreadId)};
     const visible = (el) => {
       const rect = el && el.getBoundingClientRect();
       return Boolean(rect && rect.width > 0 && rect.height > 0);
     };
     const textOf = (el) => String(el && (el.innerText || el.textContent) || '').replace(/\\s+/g, ' ').trim();
-    // The desktop ModelPicker stacks every reasoning-effort layer inside the
-    // closed trigger (aria-hidden spans cross-faded via opacity), so innerText
-    // concatenates all options. The accessible value is what survives without
-    // the aria-hidden nodes: the model name leaf plus the sr-only current
-    // effort label, e.g. "GPT-6 Sol 中".
     const stackedPickerPartsOf = (el) => {
       if (!el || (!el.querySelector('[data-reasoning-effort]') && !el.hasAttribute('data-selected-reasoning-effort'))) return [];
       const clone = el.cloneNode(true);
@@ -1486,24 +1703,16 @@ function closedComposerControlsExpression() {
         .filter(Boolean);
       return values[values.length - 1] || textOf(el);
     };
-    // The last stacked leaf is the sr-only current effort name (e.g. "中"),
-    // which is also the value published by the dedicated effort control.
-    const effortNameOf = (el) => {
-      const parts = stackedPickerPartsOf(el);
-      return parts.length > 1 ? parts[parts.length - 1] : '';
-    };
     const permission = ${visibleDesktopElementExpression('[data-composer-navigation-target="permissions"]')};
-    const intelligence = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
+    const intelligence = ${closedIntelligenceValueExpression()};
     return {
+      permissionText: textOf(permission),
       permission: permission && visible(permission) ? {
         controlId: 'codex.permission', currentValue: valueOf(permission),
         displayLabel: String(permission.getAttribute('data-composer-navigation-target') || '').trim(),
       } : null,
-      intelligence: intelligence && visible(intelligence) ? {
-        controlId: 'codex.intelligence', currentValue: valueOf(intelligence),
-        effort: effortNameOf(intelligence),
-        effortValue: String(intelligence.getAttribute('data-selected-reasoning-effort') || '').trim(),
-      } : null,
+      intelligence: intelligence.currentValue ? intelligence : null,
+      intelligenceReason: intelligence.reason,
     };
   })()`;
 }
@@ -3407,23 +3616,21 @@ class CodexDesktopController extends CdpPageClient {
 
   async openIntelligenceMenu() {
     await this.ensureReady();
-    const script = `(() => ${visibleDesktopElementExpression('[data-codex-intelligence-trigger=\"true\"]')})()`;
+    const script = `(() => {
+      const { trigger, reason, disabled } = ${intelligenceTriggerResolutionExpression(controlComposerOwnerExpression())};
+      if (trigger && !disabled) return trigger;
+      if (disabled) throw new Error('control_target_stale: 当前 Composer 模型与推理控件不可用');
+      const message = reason === 'trigger_ambiguous'
+        ? '存在多个可见的 Composer 模型与推理控件'
+        : '当前 Composer 缺少可见的模型与推理控件';
+      throw new Error('control_target_stale: ' + message);
+    })()`;
     let lastError = null;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       await this.closeVisibleMenus();
       await this.clickElement(script);
       try {
-        await this.waitFor(`(() => {
-          const trigger = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
-          if (!trigger || trigger.getAttribute('aria-expanded') !== 'true') return false;
-          const visible = (el) => {
-            const rect = el && el.getBoundingClientRect();
-            return Boolean(rect && rect.width > 0 && rect.height > 0);
-          };
-          return [...document.querySelectorAll('[role="menu"]')].some((menu) =>
-            visible(menu) && menu.getAttribute('aria-labelledby')
-          );
-        })()`, DEFAULT_ACTION_TIMEOUT_MS, 100);
+        await this.waitFor(`Boolean(${intelligenceMenuOwnerExpression()})`, DEFAULT_ACTION_TIMEOUT_MS, 100);
         return;
       } catch (err) {
         lastError = err;
@@ -3451,18 +3658,13 @@ class CodexDesktopController extends CdpPageClient {
     }
     const target = matches[0];
     const script = `(() => {
-      const visible = (el) => {
-        const rect = el && el.getBoundingClientRect();
-        return Boolean(rect && rect.width > 0 && rect.height > 0);
-      };
+      ${intelligenceVisibilitySource()}
       const isRootRow = (el, menu) => el.closest('[role="menu"]') === menu &&
         ['menuitem', 'menuitemradio', 'menuitemcheckbox'].includes(String(el.getAttribute('role') || '').toLowerCase()) &&
         el.getAttribute('aria-haspopup') === 'menu' && el.hasAttribute('aria-controls');
-      const roots = [...document.querySelectorAll('[role="menu"]')].filter((menu) =>
-        visible(menu) && [...menu.querySelectorAll('[role]')].some((el) => isRootRow(el, menu))
-      );
-      if (roots.length !== 1) return null;
-      const root = roots[0];
+      const owner = ${intelligenceMenuOwnerExpression()};
+      if (!owner) return null;
+      const root = owner.menu;
       return [...root.querySelectorAll('[role]')]
         .filter((el) => isRootRow(el, root))
         .filter(visible)
@@ -3509,10 +3711,13 @@ class CodexDesktopController extends CdpPageClient {
     }
     if (!Array.isArray(controls) || !controls.length) {
       const flatGroup = flatIntelligenceModelGroup(flatRows);
-      if (!flatGroup) throw new Error("control_target_stale: intelligence menu has no readable groups");
-      return effortRows.length
-        ? [flatGroup, { control_id: EFFORT_CONTROL_ID, label: "推理强度", rows: effortRows }]
-        : [flatGroup];
+      const groups = flatGroup ? [flatGroup] : [];
+      if (effortRows.length) {
+        // SimpleView 的单个原生滑杆同时选择模型与推理。
+        groups.push({ control_id: EFFORT_CONTROL_ID, label: flatGroup ? "推理强度" : "模型与推理", rows: effortRows });
+      }
+      if (!groups.length) throw new Error("control_target_stale: intelligence menu has no readable groups");
+      return groups;
     }
     const groups = [];
     for (const control of controls) {
@@ -3527,9 +3732,6 @@ class CodexDesktopController extends CdpPageClient {
     return groups;
   }
 
-  // Reasoning effort lives in a native slider row inside the intelligence
-  // menu. Native power selections provide the real effort names and lock
-  // state; older Desktop builds fall back to the accessibility announcement.
   async readReasoningEffortFacts() {
     return this.evaluate(reasoningSliderFactsExpression());
   }
@@ -3540,15 +3742,17 @@ class CodexDesktopController extends CdpPageClient {
 
   async openReasoningSlider() {
     await this.openIntelligenceMenu();
-    await this.waitFor(`(() => {
-      const facts = ${reasoningSliderFactsExpression()};
-      return Boolean(facts && facts.total > 0 && facts.index >= 0);
-    })()`, DEFAULT_ACTION_TIMEOUT_MS, 120);
+    try {
+      await this.waitFor(`Boolean((${reasoningSliderFactsExpression(true)})?.focused)`, DEFAULT_ACTION_TIMEOUT_MS, 120);
+    } catch (err) {
+      if (err.message !== "CDP wait timed out") throw err;
+      throw new Error("control_target_stale: native reasoning slider is not readable or focusable", { cause: err });
+    }
   }
 
   async listReasoningEffortOptions(keepOpen = false) {
-    await this.openReasoningSlider();
     try {
+      await this.openReasoningSlider();
       const rows = await this.reasoningEffortRows();
       if (!rows.length) {
         throw new Error("control_target_stale: reasoning effort slider is not readable");
@@ -3578,36 +3782,48 @@ class CodexDesktopController extends CdpPageClient {
 
   async applyReasoningEffortIndex(optionID = "", expectedRows = []) {
     const requestedOptionID = String(optionID || "").trim();
-    await this.openReasoningSlider();
     try {
-      const rows = await this.reasoningEffortRows();
+      await this.openReasoningSlider();
+      let facts = await this.readReasoningEffortFacts();
+      const rows = reasoningEffortRowsFromFacts(facts);
       if (!sameComposerMenuRows(rows, expectedRows)) {
         throw new Error("control_target_stale: reasoning effort slider structure changed");
       }
-      const matches = rows.filter((row) => row && row.optionId === requestedOptionID && !row.disabled);
-      if (matches.length !== 1) {
-        throw new Error("control_target_stale: reasoning effort option is not uniquely present in the current desktop menu");
+      const target = rows.find((row) => row.optionId === requestedOptionID && !row.disabled);
+      if (!target) {
+        throw new Error("control_target_stale: reasoning effort option is not present and available in the current desktop menu");
       }
-      const targetIndex = Number(matches[0].index);
-      const before = await this.readReasoningEffortFacts();
-      const stepKey = targetIndex >= before.index
-        ? { key: "ArrowRight", code: "ArrowRight", windowsVirtualKeyCode: 39 }
-        : { key: "ArrowLeft", code: "ArrowLeft", windowsVirtualKeyCode: 37 };
-      for (let step = 0; step < Math.abs(targetIndex - before.index); step += 1) {
-        await this.reasoningSliderKey(stepKey.key, stepKey.code, stepKey.windowsVirtualKeyCode);
-        await sleep(140);
+      const direction = Math.sign(target.index - facts.index);
+      const first = Math.min(facts.index, target.index);
+      const last = Math.max(facts.index, target.index);
+      if (rows.slice(first + 1, last).some((row) => row.disabled)) {
+        throw new Error("control_target_stale: reasoning effort path contains a locked option");
       }
-      const deadline = Date.now() + 2000;
-      let facts = null;
-      do {
-        facts = await this.readReasoningEffortFacts();
-        if (facts && facts.index === targetIndex) break;
-        await sleep(120);
-      } while (Date.now() < deadline);
-      if (!facts || facts.index !== targetIndex) {
-        throw new Error("control_target_stale: reasoning effort slider did not reach the requested level");
+      const selections = facts.selections;
+      const key = direction > 0 ? "ArrowRight" : "ArrowLeft";
+      const keyCode = direction > 0 ? 39 : 37;
+      // 每个原生方向键都会提交；确认相邻原生 ID 生效后才能继续。
+      for (let index = facts.index; index !== target.index; index += direction) {
+        if (!facts.focused) throw new Error("control_target_stale: reasoning effort slider lost focus");
+        await this.reasoningSliderKey(key, key, keyCode);
+        const nextID = selections[index + direction].id;
+        const deadline = Date.now() + 1000;
+        do {
+          facts = await this.readReasoningEffortFacts();
+          if (!sameComposerMenuRows(reasoningEffortRowsFromFacts(facts), rows)) {
+            throw new Error("control_target_stale: reasoning effort slider structure changed");
+          }
+          if (facts.selectedID === nextID) break;
+          if (facts.selectedID !== selections[index].id) {
+            throw new Error("control_target_stale: reasoning effort slider selected an unexpected option");
+          }
+          await sleep(80);
+        } while (Date.now() < deadline);
+        if (facts.selectedID !== nextID) {
+          throw new Error("control_target_stale: reasoning effort slider did not reach the requested option");
+        }
       }
-      return { index: facts.index, total: facts.total, label: facts.label, effort_value: facts.effortValue };
+      return { index: facts.index, total: rows.length, label: target.label, effort_value: facts.effortValue };
     } finally {
       await this.closeVisibleMenus();
     }
@@ -3813,22 +4029,15 @@ class CodexDesktopController extends CdpPageClient {
         for (const char of normalize(value)) hash = BigInt.asUintN(64, (hash ^ BigInt(char.codePointAt(0))) * 0x100000001b3n);
         return hash.toString(16).padStart(16, '0');
       };
-      const visible = (el) => {
-        const rect = el && el.getBoundingClientRect();
-        return Boolean(rect && rect.width > 0 && rect.height > 0);
-      };
+      ${intelligenceVisibilitySource()}
       const isRootRow = (el, menu) => el.closest('[role="menu"]') === menu &&
         ['menuitem', 'menuitemradio', 'menuitemcheckbox'].includes(String(el.getAttribute('role') || '').toLowerCase()) &&
         el.getAttribute('aria-haspopup') === 'menu' && el.hasAttribute('aria-controls');
       const isMenuRow = (el) => ['menuitem', 'menuitemradio', 'menuitemcheckbox', 'option']
         .includes(String(el && el.getAttribute('role') || '').toLowerCase());
-      const trigger = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
-      if (!trigger) return null;
-      const menus = [...document.querySelectorAll('[role="menu"]')].filter((menu) =>
-        visible(menu) && [...menu.querySelectorAll('[role]')].some((el) => isRootRow(el, menu))
-      );
-      if (menus.length !== 1) return null;
-      const root = menus[0];
+      const owner = ${intelligenceMenuOwnerExpression()};
+      if (!owner) return null;
+      const root = owner.menu;
       const roots = [...root.querySelectorAll('[role]')]
         .filter((el) => isRootRow(el, root))
         .filter(visible)
@@ -3895,19 +4104,10 @@ class CodexDesktopController extends CdpPageClient {
           throw new Error("control_target_stale: flat intelligence option is not uniquely present in the current desktop menu");
         }
         const target = `(() => {
-          const trigger = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
-          if (!trigger) return null;
-          const visible = (el) => {
-            const rect = el && el.getBoundingClientRect();
-            return Boolean(rect && rect.width > 0 && rect.height > 0);
-          };
-          const triggerID = String(trigger.id || '').trim();
-          const controlledMenuID = String(trigger.getAttribute('aria-controls') || '').trim();
-          const menus = [...document.querySelectorAll('[role="menu"]')].filter((menu) =>
-            visible(menu) && ((triggerID && String(menu.getAttribute('aria-labelledby') || '').trim() === triggerID) ||
-              (controlledMenuID && String(menu.id || '').trim() === controlledMenuID))
-          );
-          if (menus.length !== 1) return null;
+          const owner = ${intelligenceMenuOwnerExpression()};
+          if (!owner) return null;
+          const { menu } = owner;
+          ${intelligenceVisibilitySource()}
           const fingerprint = (value) => {
             let hash = 0xcbf29ce484222325n;
             for (const char of String(value || '').normalize('NFKC').replace(/\\s+/g, ' ').trim().toLocaleLowerCase()) {
@@ -3915,8 +4115,8 @@ class CodexDesktopController extends CdpPageClient {
             }
             return hash.toString(16).padStart(16, '0');
           };
-          const matches = [...menus[0].querySelectorAll('[role="menuitemradio"]')]
-            .filter((el) => el.closest('[role="menu"]') === menus[0] && visible(el))
+          const matches = [...menu.querySelectorAll('[role="menuitemradio"]')]
+            .filter((el) => el.closest('[role="menu"]') === menu && visible(el))
             .filter((el) => {
               const name = String(el.getAttribute('aria-label') || el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
               return ${JSON.stringify(FLAT_INTELLIGENCE_MODEL_CONTROL_ID)} + ':' + fingerprint(name) === ${JSON.stringify(String(optionID || "").trim())};
@@ -4230,44 +4430,32 @@ class CodexDesktopController extends CdpPageClient {
     }
   }
 
-  async composerControlState() {
-    return this.evaluate(`(() => {
-      const textOf = (el) => (el ? (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim() : '');
-      // Mirrors closedComposerControlsExpression: the stacked ModelPicker
-      // trigger hides all non-current effort layers behind aria-hidden, so the
-      // readable label is the model-name leaf plus the sr-only current effort.
-      const stackedPickerParts = (el) => {
-        if (!el || (!el.querySelector('[data-reasoning-effort]') && !el.hasAttribute('data-selected-reasoning-effort'))) return [];
-        const clone = el.cloneNode(true);
-        clone.querySelectorAll('[aria-hidden="true"]').forEach((node) => node.remove());
-        return [...clone.querySelectorAll('span')]
-          .filter((node) => node.children.length === 0)
-          .map((node) => textOf(node))
-          .filter(Boolean);
-      };
-      const permission = ${visibleDesktopElementExpression('[data-composer-navigation-target="permissions"]')};
-      const intelligence = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
-      const effortAttr = intelligence ? (intelligence.getAttribute('data-selected-reasoning-effort') || '').trim() : '';
-      const pickerParts = stackedPickerParts(intelligence);
-      return {
-        permission: textOf(permission),
-        intelligence: pickerParts.length ? pickerParts.join(' ') : textOf(intelligence),
-        model: pickerParts[0] || '',
-        reasoning: effortAttr,
-        reasoningLabel: effortAttr,
-        reasoningEffort: effortAttr,
-      };
-    })()`);
+  async composerControlState(threadId = "") {
+    const expectedThreadId = String(threadId || "").trim();
+    const controls = await this.evaluate(closedComposerControlsExpression(expectedThreadId));
+    if (!controls) return null;
+    const { intelligence, permissionText } = controls;
+    const effort = intelligence?.effortValue || "";
+    return {
+      permission: permissionText || "",
+      intelligence: intelligence?.currentValue || "",
+      model: intelligence?.model || "",
+      reasoning: effort,
+      reasoningLabel: effort,
+      reasoningEffort: effort,
+    };
   }
 
-  async closedComposerControls() {
-    const controls = await this.evaluate(closedComposerControlsExpression());
+  async closedComposerControls(threadId = "") {
+    const expectedThreadId = String(threadId || "").trim();
+    const controls = await this.evaluate(closedComposerControlsExpression(expectedThreadId));
     if (!controls || typeof controls !== "object") {
-      return { permission: null, intelligence: null };
+      return { permission: null, intelligence: null, intelligenceReason: "read_failed" };
     }
     return {
       permission: controls.permission && typeof controls.permission === "object" ? controls.permission : null,
       intelligence: controls.intelligence && typeof controls.intelligence === "object" ? controls.intelligence : null,
+      intelligenceReason: controls.intelligenceReason || "",
     };
   }
 
@@ -4276,25 +4464,14 @@ class CodexDesktopController extends CdpPageClient {
   async composerControlReadiness(threadId = "") {
     const expectedThreadId = String(threadId || "").trim();
     return this.evaluate(`(() => {
-      const visible = (el) => {
-        if (!el) return false;
-        const rect = el.getBoundingClientRect();
-        return Boolean(rect && rect.width > 0 && rect.height > 0);
-      };
-      const normalizeThreadId = (value) => {
-        const text = String(value || '').trim();
-        const match = text.match(/(^|:)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
-        return match && match[2] ? match[2] : text;
-      };
-      const selectedThreadId = ${foregroundThreadIdExpression()};
-      const composer = ${composerContainerElementExpression()};
-      const intelligence = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
+      const foreground = ${controlComposerOwnerExpression(expectedThreadId)};
+      const { trigger } = ${intelligenceTriggerResolutionExpression()};
       const permission = ${visibleDesktopElementExpression('[data-composer-navigation-target="permissions"]')};
       return {
-        selected: ${JSON.stringify(expectedThreadId)} ? selectedThreadId === ${JSON.stringify(expectedThreadId)} : Boolean(selectedThreadId),
-        composer: visible(composer),
-        intelligence: visible(intelligence),
-        permission: visible(permission),
+        selected: Boolean(foreground?.threadId),
+        composer: Boolean(foreground),
+        intelligence: Boolean(trigger),
+        permission: Boolean(permission),
       };
     })()`);
   }
