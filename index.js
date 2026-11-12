@@ -1394,7 +1394,7 @@ function isArchivedRolloutPath(file) {
 
 function isUserVisibleThread(item) {
   const source = String(item && item.metadata && item.metadata.thread_source || "").trim().toLowerCase();
-  return source === "" || source === "user";
+  return source === "" || source === "user" || source === "agent_created_thread";
 }
 
 function isDesktopVisibleThread(item, sessionIndexMap) {
