@@ -1,57 +1,49 @@
 "use strict";
 
-// Contract verified against request-user-input-panel in Desktop 26.1021.31345.
-// Only the mounted native question renderer is supported; arbitrary dialogs,
-// permission prompts and questionnaire variants remain outside this capability.
-function questionOwnerSource(foregroundExpression = '') {
+function committedFiberSource() {
   return `
-    const questionOwn = (value, key) => {
+    const reactOwn = (value, key) => {
       try { return Object.getOwnPropertyDescriptor(value, key)?.value; } catch { return undefined; }
-    };
-    const questionVisible = (el) => {
-      if (!el || el.closest('[hidden], [inert], [aria-hidden="true"]')) return false;
-      const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0;
     };
     // DOM pointers may reference either Fiber alternate. Resolve the committed
     // branch using React's root.current and shared-child bailout rules, without
     // walking the entire application tree on each watcher poll.
     // https://github.com/facebook/react/blob/main/packages/react-reconciler/src/ReactFiberTreeReflection.js
-    const questionStats = {scannedInputs:0, resolvedInputs:0, renderers:0, asyncPanels:0, asyncKeys:0, inactive:0, invalid:0};
-    const questionFiberCache = new Map();
-    const questionCurrentFiber = fiber => {
+    const reactFiberCache = new Map();
+    const reactCurrentFiber = fiber => {
       if (!fiber) return null;
-      const alternate = questionOwn(fiber, 'alternate');
+      const alternate = reactOwn(fiber, 'alternate');
       if (!alternate) return fiber;
       let a = fiber, b = alternate;
       for (let depth = 0; depth < 256; depth++) {
-        const parentA = questionOwn(a, 'return');
+        const parentA = reactOwn(a, 'return');
         if (!parentA) {
-          const current = questionOwn(questionOwn(a, 'stateNode'), 'current');
+          const current = reactOwn(reactOwn(a, 'stateNode'), 'current');
           return current === a ? fiber : current === b ? alternate : null;
         }
-        const parentB = questionOwn(parentA, 'alternate');
+        const parentB = reactOwn(parentA, 'alternate');
         if (!parentB) {
-          const next = questionOwn(parentA, 'return');
+          const next = reactOwn(parentA, 'return');
           if (!next) return null;
           a = b = next;
           continue;
         }
-        const childA = questionOwn(parentA, 'child'), childB = questionOwn(parentB, 'child');
+        const childA = reactOwn(parentA, 'child'), childB = reactOwn(parentB, 'child');
         if (childA === childB) {
           let child = childA;
-          for (let n = 0; child && n < 50000; n++, child = questionOwn(child, 'sibling')) {
+          for (let n = 0; child && n < 50000; n++, child = reactOwn(child, 'sibling')) {
             if (child === a) return fiber;
             if (child === b) return alternate;
           }
           return null;
         }
-        if (questionOwn(a, 'return') !== questionOwn(b, 'return')) {
+        if (reactOwn(a, 'return') !== reactOwn(b, 'return')) {
           a = parentA; b = parentB;
         } else {
           let found = false;
           for (const parent of [parentA, parentB]) {
-            let child = questionOwn(parent, 'child');
-            for (let n = 0; child && n < 50000; n++, child = questionOwn(child, 'sibling')) {
+            let child = reactOwn(parent, 'child');
+            for (let n = 0; child && n < 50000; n++, child = reactOwn(child, 'sibling')) {
               if (child === a) { a = parent; b = parent === parentA ? parentB : parentA; found = true; break; }
               if (child === b) { b = parent; a = parent === parentA ? parentB : parentA; found = true; break; }
             }
@@ -59,15 +51,31 @@ function questionOwnerSource(foregroundExpression = '') {
           }
           if (!found) return null;
         }
-        if (questionOwn(a, 'alternate') !== b) return null;
+        if (reactOwn(a, 'alternate') !== b) return null;
       }
       return null;
     };
-    const questionFiber = fiber => {
+    const reactFiber = fiber => {
       if (!fiber) return null;
-      if (!questionFiberCache.has(fiber)) questionFiberCache.set(fiber, questionCurrentFiber(fiber));
-      return questionFiberCache.get(fiber);
+      if (!reactFiberCache.has(fiber)) reactFiberCache.set(fiber, reactCurrentFiber(fiber));
+      return reactFiberCache.get(fiber);
     };
+  `;
+}
+
+// Contract verified against request-user-input-panel in Desktop 26.1021.31345.
+// Only the mounted native question renderer is supported; arbitrary dialogs,
+// permission prompts and questionnaire variants remain outside this capability.
+function questionOwnerSource(foregroundExpression = '') {
+  return `
+    ${committedFiberSource()}
+    const questionOwn = reactOwn;
+    const questionFiber = reactFiber;
+    const questionVisible = (el) => {
+      if (!el || el.closest('[hidden], [inert], [aria-hidden="true"]')) return false;
+      const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0;
+    };
+    const questionStats = {scannedInputs:0, resolvedInputs:0, renderers:0, asyncPanels:0, asyncKeys:0, inactive:0, invalid:0};
     const questionThreadId = value => { const text = String(value || '').trim(); const match = text.match(/(?:^|:)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i); return match ? match[1] : text; };
     const questionOwners = new Map();
     const questionVisited = new Set();
@@ -168,4 +176,4 @@ function validateQuestionAnswers(questions, encoded, skip = false) {
   });
 }
 
-module.exports = {questionOwnerSource, questionReadExpression, validateQuestionAnswers};
+module.exports = {committedFiberSource, questionOwnerSource, questionReadExpression, validateQuestionAnswers};
