@@ -63,6 +63,13 @@ const DEFAULT_MODEL_OPTIONS = [];
 let sessionFilesCache = { at: 0, files: [] };
 let stateQueryTail = Promise.resolve();
 let sessionListCache = { at: 0, threads: null, inFlight: null };
+// 附属侧聊的目录准入按 Codex 原生 attached_thread_parent_id 判定，绝不按标题去重。
+// 该列只存在于较新的状态库；旧版本没有该列时所有会话都按独立会话处理。
+const ATTACHED_THREAD_CACHE_TTL_MS = 30 * 1000;
+const ATTACHED_THREAD_COLUMN_RECHECK_MS = 60 * 1000;
+const ATTACHED_THREAD_CACHE_MAX = 256;
+const attachedThreadParentCache = new Map();
+let attachedThreadColumnCache = { db: "", present: false, checkedAt: 0 };
 let codexDesktopControllerPromise = null;
 const desktopWatchSubscribers = new Map();
 const agentUsageSubscribers = new Set();
@@ -88,6 +95,10 @@ const deferredDesktopWatchBursts = new Map();
 const DESKTOP_WATCH_UNAVAILABLE_AFTER_POLLS = 3;
 let desktopWatchState = createDesktopWatchState();
 let desktopDirectoryState = createDesktopDirectoryState();
+// 目录快照确认的附属线程集合与代次。排队事件在发布后、投递前若原生关系
+// 发生变化，用它们撤销已经过期的 session_hint。
+let desktopDirectoryAttachedThreadIDs = new Set();
+let desktopDirectoryAttachmentEpoch = 0;
 let desktopDirectoryWatchers = [];
 let desktopDirectoryPollTimer = null;
 const DESKTOP_WATCH_BURST_DELAYS_MS = [0, 180, 500, 1100, 2200, 4500];
@@ -1191,6 +1202,99 @@ async function queryStateRows(sql) {
   }
 }
 
+function attachedThreadParentIDFromRow(row) {
+  const id = firstNonEmpty(row && row.id);
+  const parentID = firstNonEmpty(row && row.attached_thread_parent_id);
+  // 只有非空的原生附属关系才排除目录项；空值保留为独立会话。
+  if (!isThreadID(id) || !parentID) {
+    return "";
+  }
+  return parentID;
+}
+
+function rememberThreadAttachment(threadID, parentID) {
+  const normalized = firstNonEmpty(threadID);
+  if (!isThreadID(normalized)) return;
+  retainRecentCacheEntry(
+    attachedThreadParentCache,
+    normalized,
+    { parentID: firstNonEmpty(parentID), at: Date.now() },
+    ATTACHED_THREAD_CACHE_MAX,
+  );
+}
+
+// 同步读取已观察到的附属关系，供事件发布路径复用同一目录准入边界。
+function threadKnownAttachedSideChat(threadID) {
+  const cached = attachedThreadParentCache.get(firstNonEmpty(threadID));
+  return Boolean(cached && cached.parentID);
+}
+
+async function threadsHaveAttachedParentColumn() {
+  const db = stateDBPath();
+  if (!db) return false;
+  const nowMs = Date.now();
+  if (attachedThreadColumnCache.db === db
+      && (attachedThreadColumnCache.present
+        || nowMs - attachedThreadColumnCache.checkedAt < ATTACHED_THREAD_COLUMN_RECHECK_MS)) {
+    return attachedThreadColumnCache.present;
+  }
+  const rows = await queryStateRows("PRAGMA table_info(threads);").catch(() => []);
+  const present = rows.some((row) => String(row && row.name || "").trim() === "attached_thread_parent_id");
+  attachedThreadColumnCache = { db, present, checkedAt: nowMs };
+  return present;
+}
+
+async function threadAttachedParentID(threadID) {
+  const normalized = firstNonEmpty(threadID);
+  if (!isThreadID(normalized)) return "";
+  const cached = attachedThreadParentCache.get(normalized);
+  if (cached && Date.now() - cached.at < ATTACHED_THREAD_CACHE_TTL_MS) {
+    retainRecentCacheEntry(attachedThreadParentCache, normalized, cached, ATTACHED_THREAD_CACHE_MAX);
+    return cached.parentID;
+  }
+  if (!(await threadsHaveAttachedParentColumn())) {
+    rememberThreadAttachment(normalized, "");
+    return "";
+  }
+  let rows;
+  try {
+    rows = await queryStateRows(`
+      SELECT TRIM(COALESCE(attached_thread_parent_id, '')) AS attached_thread_parent_id
+      FROM threads
+      WHERE id = '${sqliteEscape(normalized)}'
+      LIMIT 1;
+    `);
+  } catch {
+    // 读取失败时按未观察到处理且不写缓存，下一次轮询重试。
+    return "";
+  }
+  const parentID = rows.length > 0
+    ? attachedThreadParentIDFromRow({ id: normalized, attached_thread_parent_id: rows[0] && rows[0].attached_thread_parent_id })
+    : "";
+  rememberThreadAttachment(normalized, parentID);
+  return parentID;
+}
+
+async function threadIsAttachedSideChat(threadID) {
+  return Boolean(await threadAttachedParentID(threadID));
+}
+
+function updateDesktopDirectoryAttachments(attachedThreadIDs) {
+  const next = new Set(attachedThreadIDs);
+  const changed = next.size !== desktopDirectoryAttachedThreadIDs.size
+    || [...next].some((threadID) => !desktopDirectoryAttachedThreadIDs.has(threadID));
+  if (!changed) return;
+  desktopDirectoryAttachedThreadIDs = next;
+  desktopDirectoryAttachmentEpoch += 1;
+}
+
+function desktopDirectoryAttachedSince(threadID, attachmentEpoch) {
+  const normalized = firstNonEmpty(threadID);
+  return Boolean(normalized)
+    && desktopDirectoryAttachmentEpoch !== attachmentEpoch
+    && desktopDirectoryAttachedThreadIDs.has(normalized);
+}
+
 async function execStateSQL(sql) {
   const db = stateDBPath();
   if (!db) {
@@ -1422,29 +1526,86 @@ async function readThreadsFromState(limit = 0, options = {}) {
     ? Math.max(1, Math.floor(requestedLimit))
     : SESSION_LIST_DEFAULT_LIMIT;
   const sqlLimit = `\n    LIMIT ${Math.max(queryLimit, Math.min(SESSION_LIST_DEFAULT_LIMIT, queryLimit * 4))}`;
-  const rows = await queryStateRows(`
+  const hasAttachedParentColumn = await threadsHaveAttachedParentColumn();
+  const directoryColumns = [
+    "id",
+    "title",
+    "cwd",
+    "rollout_path",
+    "tokens_used",
+    "model_provider",
+    "model",
+    "reasoning_effort",
+    "sandbox_policy",
+    "approval_mode",
+    "memory_mode",
+    "agent_nickname",
+    "thread_source",
+    "updated_at_ms",
+    "created_at_ms",
+    "recency_at_ms",
+  ];
+  const directorySelect = [
+    "id",
+    `substr(title, 1, ${SESSION_LIST_TITLE_MAX_CHARS}) AS title`,
+    "cwd",
+    "rollout_path",
+    "tokens_used",
+    "model_provider",
+    "model",
+    "reasoning_effort",
+    "sandbox_policy",
+    "approval_mode",
+    "memory_mode",
+    "agent_nickname",
+    "thread_source",
+    "updated_at_ms",
+    "created_at_ms",
+    "recency_at_ms",
+  ];
+  const attachedParentColumn = hasAttachedParentColumn
+    ? "TRIM(COALESCE(attached_thread_parent_id, '')) AS attached_thread_parent_id"
+    : "'' AS attached_thread_parent_id";
+  const directoryPageSQL = `
+    SELECT ${directoryColumns.join(", ")}, attached_thread_parent_id, 0 AS attached_row
+    FROM (
+      SELECT ${directorySelect.join(", ")}, ${attachedParentColumn}
+      FROM threads
+      WHERE archived = 0${hasAttachedParentColumn ? " AND TRIM(COALESCE(attached_thread_parent_id, '')) = ''" : ""}
+      ORDER BY recency_at_ms DESC, updated_at_ms DESC${sqlLimit}
+    )`;
+  // 附属侧聊不进入目录分页，只回传 ID 与父 ID 供准入缓存使用；同一查询
+  // 保证大量侧聊不会挤占独立会话的目录位置。
+  const attachedRowsSQL = hasAttachedParentColumn
+    ? `
+    UNION ALL
     SELECT
       id,
-      substr(title, 1, ${SESSION_LIST_TITLE_MAX_CHARS}) AS title,
-      cwd,
-      rollout_path,
-      tokens_used,
-      model_provider,
-      model,
-      reasoning_effort,
-      sandbox_policy,
-      approval_mode,
-      memory_mode,
-      agent_nickname,
-      thread_source,
-      updated_at_ms,
-      created_at_ms,
-      recency_at_ms
+      ${directoryColumns.slice(1).map(() => "NULL").join(", ")},
+      TRIM(COALESCE(attached_thread_parent_id, '')) AS attached_thread_parent_id,
+      1 AS attached_row
     FROM threads
-    WHERE archived = 0
-    ORDER BY recency_at_ms DESC, updated_at_ms DESC${sqlLimit};
-  `);
-  let items = rows
+    WHERE archived = 0 AND TRIM(COALESCE(attached_thread_parent_id, '')) <> ''`
+    : "";
+  const rows = await queryStateRows(`${directoryPageSQL}${attachedRowsSQL}
+    ORDER BY recency_at_ms DESC, updated_at_ms DESC;`);
+  const catalogRows = [];
+  const attachedThreadIDs = [];
+  for (const row of rows) {
+    const threadID = firstNonEmpty(row && row.id);
+    if (Number(row && row.attached_row) === 1) {
+      const parentID = attachedThreadParentIDFromRow(row);
+      if (threadID && parentID) {
+        rememberThreadAttachment(threadID, parentID);
+        attachedThreadIDs.push(threadID);
+      }
+      continue;
+    }
+    rememberThreadAttachment(threadID, "");
+    catalogRows.push(row);
+  }
+  updateDesktopDirectoryAttachments(attachedThreadIDs);
+  let items = catalogRows
     .map((row) => rowToThreadItem(row, sessionIndexMap.get(firstNonEmpty(row && row.id)) || ""))
     .map(enrichThreadItemWithRollout)
     .filter((item) => isThreadID(item.id) && isUserVisibleThread(item) && isDesktopVisibleThread(item, sessionIndexMap))
@@ -1457,6 +1618,7 @@ async function readThreadsFromState(limit = 0, options = {}) {
     limit: queryLimit,
     include_desktop_snapshot: options && options.includeDesktopSnapshot ? "true" : "false",
     count: items.length,
+    attached: attachedThreadIDs.length,
   });
   return items;
 }
@@ -5872,7 +6034,16 @@ async function readSessionListSnapshot(limit = 0, options = {}) {
     // session index is also empty. Returning [] while that index still has
     // entries would erase a valid remote index during a transient SQLite read.
     if (threads.length === 0 && indexedThreads.length > 0) {
-      throw new Error(`Codex session list incomplete: state query returned no visible threads while session index has ${indexedThreads.length}`);
+      // 附属关系和原生归档可以解释侧聊过滤后的空目录；其余未知索引项仍视为
+      // 不完整状态读取，避免瞬时 SQLite 结果清空远端目录。
+      let unmatched = indexedThreads.filter((item) => !desktopDirectoryAttachedThreadIDs.has(item.id));
+      if (desktopDirectoryAttachedThreadIDs.size > 0 && unmatched.length > 0) {
+        const archived = new Set((await queryStateRows("SELECT id FROM threads WHERE archived <> 0;")).map((row) => row && row.id));
+        unmatched = unmatched.filter((item) => !archived.has(item.id));
+      }
+      if (unmatched.length > 0) {
+        throw new Error(`Codex session list incomplete: state query returned no visible threads while session index has ${indexedThreads.length}`);
+      }
     }
     sessionListCache.at = Date.now();
     sessionListCache.threads = threads;
@@ -6238,7 +6409,7 @@ async function desktopRunFileWatchPoll(threadID) {
   if (decision.action === "continue") return;
   desktopRunFileWatchStop(threadID);
   if (decision.action === "terminal") {
-    await emitDesktopTerminalRunEvents(threadID, decision.status, null, null);
+    await emitDesktopTerminalRunEvents(threadID, decision.status, null, undefined);
   }
 }
 
@@ -6250,6 +6421,24 @@ function desktopTerminalRunSummary(status, runSummary, latestSummary) {
 }
 
 function desktopTerminalRunEvent(threadID, status, summary, sessionHint, detailSnapshot, terminalID = "") {
+  const payload = {
+    thread_id: threadID,
+    native_session: {
+      plugin_id: "codex",
+      native_session_id: threadID,
+      native_thread_id: threadID,
+      surface: "codex-desktop",
+      endpoint: deepLink(threadID),
+      cwd: firstNonEmpty(sessionHint && sessionHint.cwd),
+    },
+    detail_snapshot: detailSnapshot || undefined,
+  };
+  // 附属侧聊不发布目录提示；native_session 与明细仍保留，已有绑定继续收到终态。
+  if (!(sessionHint === null || threadKnownAttachedSideChat(threadID))) {
+    payload.session_hint = sessionHint && typeof sessionHint === "object"
+      ? sessionHint
+      : desktopSessionHint(threadID, {}, status);
+  }
   return {
     // Deterministic per settled run: the gateway deduplicates on the payload
     // event_id, so a re-emission after a plugin restart must keep this stable.
@@ -6258,19 +6447,7 @@ function desktopTerminalRunEvent(threadID, status, summary, sessionHint, detailS
     Status: status,
     Summary: summary,
     CreatedAt: new Date().toISOString(),
-    Payload: {
-      thread_id: threadID,
-      native_session: {
-        plugin_id: "codex",
-        native_session_id: threadID,
-        native_thread_id: threadID,
-        surface: "codex-desktop",
-        endpoint: deepLink(threadID),
-        cwd: firstNonEmpty(sessionHint && sessionHint.cwd),
-      },
-      session_hint: sessionHint && typeof sessionHint === "object" ? sessionHint : desktopSessionHint(threadID, {}, status),
-      detail_snapshot: detailSnapshot || undefined,
-    },
+    Payload: payload,
   };
 }
 
@@ -6298,7 +6475,8 @@ async function emitDesktopTerminalRunEvents(threadID, status, detailSnapshot, se
     threadID,
     normalized,
     desktopTerminalRunSummary(normalized, runSummary, latestSummary),
-    sessionHint,
+    // 终态事件同样经过目录准入：附属侧聊只保留绑定路由，不重新发布目录提示。
+    await threadIsAttachedSideChat(threadID) ? null : (sessionHint === null ? null : sessionHint),
     detailSnapshot,
     terminal.terminalID,
   );
@@ -6408,35 +6586,49 @@ function desktopSessionHint(threadID, snapshot = {}, status = "") {
   };
 }
 
-function emitDesktopWatchDetail(subscriber, threadID, detailSnapshot, status, summary, sessionHint = null) {
+// session_hint 会让 Hub 把原生会话 upsert 回远端目录；附属侧聊必须与
+// listSessions 使用同一准入边界，因此这里返回 null 表示不发布目录提示。
+async function desktopWatchSessionHint(threadID, snapshot = {}, status = "") {
+  if (await threadIsAttachedSideChat(threadID)) return null;
+  return desktopSessionHint(threadID, snapshot, status);
+}
+
+function emitDesktopWatchDetail(subscriber, threadID, detailSnapshot, status, summary, sessionHint) {
   if (!subscriber || !isThreadID(threadID) || !detailSnapshot) return;
   subscriber.detailSnapshot = detailSnapshot;
-  const hint = sessionHint && typeof sessionHint === "object"
-    ? sessionHint
-    : subscriber.sessionHint && typeof subscriber.sessionHint === "object"
-      ? subscriber.sessionHint
-      : desktopSessionHint(threadID, {}, status);
+  // null 表示这次事件明确不携带 session_hint（附属侧聊），不能回退到旧值。
+  // 其余事件复用同一目录准入边界：已知附属侧聊一律不再发布目录提示。
+  const hint = sessionHint === null || threadKnownAttachedSideChat(threadID)
+    ? null
+    : sessionHint && typeof sessionHint === "object"
+      ? sessionHint
+      : subscriber.sessionHint && typeof subscriber.sessionHint === "object"
+        ? subscriber.sessionHint
+        : desktopSessionHint(threadID, {}, status);
   subscriber.sessionHint = hint;
+  const payload = {
+    desktop_live: true,
+    primary_action: firstNonEmpty(detailSnapshot.primary_action),
+    detail_snapshot: detailSnapshot,
+    native_session: {
+      plugin_id: "codex",
+      native_session_id: threadID,
+      native_thread_id: threadID,
+      surface: "codex-desktop",
+      endpoint: deepLink(threadID),
+      cwd: firstNonEmpty(hint && hint.cwd),
+    },
+  };
+  if (hint) {
+    payload.session_hint = hint;
+  }
   emitDesktopWatchEvent(subscriber, {
     ID: `desktop-watch-${threadID}-${Date.now()}`,
     Type: "desktop.state.changed",
     Status: status,
     Summary: summary,
     CreatedAt: new Date().toISOString(),
-    Payload: {
-      desktop_live: true,
-      primary_action: firstNonEmpty(detailSnapshot.primary_action),
-      detail_snapshot: detailSnapshot,
-      native_session: {
-        plugin_id: "codex",
-        native_session_id: threadID,
-        native_thread_id: threadID,
-        surface: "codex-desktop",
-        endpoint: deepLink(threadID),
-        cwd: firstNonEmpty(hint.cwd),
-      },
-      session_hint: hint,
-    },
+    Payload: payload,
   });
 }
 
@@ -6520,6 +6712,9 @@ function emitDesktopDirectoryReconciled() {
 function emitDesktopDirectoryIndexChanged(thread) {
   const hint = desktopDirectorySessionHint(thread);
   if (!isThreadID(hint.native_thread_id)) return;
+  // 目录快照已排除附属侧聊；这里再按同一准入边界兜底，避免并发刷新期间
+  // 已关联的会话通过 index.changed 短暂重新加入目录。
+  if (threadKnownAttachedSideChat(hint.native_thread_id)) return;
   for (const subscriber of desktopWatchSubscribers.values()) {
     if (!subscriber || !subscriber.pluginWide) continue;
     emitDesktopWatchEvent(subscriber, {
@@ -6561,7 +6756,11 @@ async function reconcileDesktopDirectoryFromStorage() {
   desktopDirectoryState.running = true;
   desktopDirectoryState.dirty = false;
   try {
+    const attachmentEpochBefore = desktopDirectoryAttachmentEpoch;
     const threads = await readSessionListSnapshot(0, { force: true });
+    // 附属关系变化会改变目录准入；即使分页结果没有显式增删，也要求 Hub
+    // 依据新快照完整重建，清掉此前可能由排队事件写回的侧聊目录项。
+    const attachmentsChanged = desktopDirectoryAttachmentEpoch !== attachmentEpochBefore;
     const diff = desktopDirectoryDiff(desktopDirectoryState.threads, threads);
     const initial = !desktopDirectoryState.initialized;
     desktopDirectoryState.initialized = true;
@@ -6574,7 +6773,7 @@ async function reconcileDesktopDirectoryFromStorage() {
     for (const thread of [...diff.added, ...diff.changed]) {
       emitDesktopDirectoryIndexChanged(thread);
     }
-    let requiresCompleteRebuild = false;
+    let requiresCompleteRebuild = attachmentsChanged;
     for (const thread of diff.removed) {
       const threadID = firstNonEmpty(thread && thread.id);
       if (await threadArchivedInState(threadID)) {
@@ -6820,7 +7019,7 @@ async function pollDesktopWatch() {
       reportDesktopWatchFailure();
       return;
     }
-    const sessionHint = desktopSessionHint(threadID, snapshot, status);
+    const sessionHint = await desktopWatchSessionHint(threadID, snapshot, status);
     if (transition.switched) {
       for (const subscriber of desktopWatchSubscribers.values()) {
         if (subscriber.pluginWide || subscriber.threadID === transition.previousThreadID) {
@@ -6918,16 +7117,18 @@ function createDesktopWatchEventQueue(signal, options = {}) {
   return {
     push(event) {
       if (closed) return;
+      // 记录入队时的附属关系代次；投递前若关系已变化，撤销过期的目录提示。
+      const entry = { done: false, value: event, attachmentEpoch: desktopDirectoryAttachmentEpoch };
       const waiter = waiters.shift();
       if (waiter) {
-        waiter({ done: false, value: event });
+        waiter(entry);
         return;
       }
       const coalesceKey = desktopWatchEventCoalesceKey(event);
       if (coalesceKey) {
-        const existingIndex = pending.findIndex((candidate) => desktopWatchEventCoalesceKey(candidate) === coalesceKey);
+        const existingIndex = pending.findIndex((candidate) => desktopWatchEventCoalesceKey(candidate.value) === coalesceKey);
         if (existingIndex >= 0) {
-          pending[existingIndex] = event;
+          pending[existingIndex] = entry;
           recordDesktopWatchMetric("queue_events_coalesced");
           return;
         }
@@ -6942,16 +7143,32 @@ function createDesktopWatchEventQueue(signal, options = {}) {
         logDesktopWatchTelemetry(true);
         return;
       }
-      pending.push(event);
+      pending.push(entry);
       observeDesktopWatchQueueDepth(pending.length);
     },
     next() {
-      if (pending.length > 0) return Promise.resolve({ done: false, value: pending.shift() });
+      if (pending.length > 0) return Promise.resolve(pending.shift());
       if (closed) return Promise.resolve({ done: true, value: undefined });
       return new Promise((resolve) => waiters.push(resolve));
     },
     close,
   };
+}
+
+function desktopWatchEventForSubscription(entry, pluginWide = false) {
+  const event = entry && entry.value;
+  if (!event) return event;
+  // 前台不可用通知只携带路由，不参与目录准入，不能被附属关系变化吞掉。
+  if (event.Type === "watcher.foreground.unavailable") return event;
+  const payload = event.Payload && typeof event.Payload === "object" ? event.Payload : {};
+  const session = payload.native_session && typeof payload.native_session === "object" ? payload.native_session : {};
+  const threadID = firstNonEmpty(session.native_thread_id, session.native_session_id);
+  if (!desktopDirectoryAttachedSince(threadID, entry.attachmentEpoch)) return event;
+  // 入队后确认的新附属关系撤销过期目录提示：目录订阅完全丢弃该事件，
+  // 单会话订阅保留详情与绑定路由，只移除 session_hint。
+  if (pluginWide) return null;
+  if (!payload.session_hint) return event;
+  return { ...event, Payload: { ...payload, session_hint: undefined } };
 }
 
 async function* subscribe(session, signal) {
@@ -6976,7 +7193,8 @@ async function* subscribe(session, signal) {
     while (true) {
       const next = await queue.next();
       if (next.done) return;
-      yield next.value;
+      const event = desktopWatchEventForSubscription(next);
+      if (event) yield event;
     }
   } finally {
     queue.close();
@@ -7009,7 +7227,8 @@ async function* subscribePlugin(signal) {
     while (true) {
       const next = await queue.next();
       if (next.done) return;
-      yield next.value;
+      const event = desktopWatchEventForSubscription(next, true);
+      if (event) yield event;
     }
   } finally {
     queue.close();
@@ -7293,5 +7512,15 @@ module.exports = {
     objectiveControlTarget,
     readCodexConfigText,
     windowsCodexInstalled,
+    listSessions,
+    attachSession,
+    findThreadByID,
+    readThreadsFromState,
+    readSessionListSnapshot,
+    threadAttachedParentID,
+    threadIsAttachedSideChat,
+    desktopWatchSessionHint,
+    updateDesktopDirectoryAttachments,
+    desktopWatchEventForSubscription,
   },
 };
