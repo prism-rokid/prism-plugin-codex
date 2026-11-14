@@ -1887,12 +1887,26 @@ async function listCodexProcesses() {
   return [];
 }
 
-function processMatchesUserDataDir(proc, userDataDir = "") {
+// Chromium 只在显式启动参数中记录 --user-data-dir，并且同时支持
+// --flag=value 与 --flag value。路径可能包含空格，所以值一直取到下一个
+// -- 开关或行尾，不能按第一个空格截断。
+function processUserDataDir(command = "") {
+  const match = String(command || "").match(/(?:^|\s)--user-data-dir(?:=|\s+)(?:"([^"]*)"|'([^']*)'|(.+?))(?=\s+--|\s*$)/);
+  return firstNonEmpty(match && match[1], match && match[2], match && match[3]);
+}
+
+function processMatchesUserDataDir(proc, userDataDir = "", defaultDir = defaultProfileDir()) {
   const normalized = firstNonEmpty(userDataDir);
   if (!normalized) {
     return true;
   }
-  return String(proc && proc.command || "").includes(`--user-data-dir=${normalized}`);
+  const explicit = processUserDataDir(proc && proc.command);
+  if (explicit) {
+    return path.resolve(explicit) === path.resolve(normalized);
+  }
+  // 没有 --user-data-dir 的 Codex/ChatGPT 主进程使用平台默认 profile；
+  // 普通启动（不经过 Prism 托管）就属于这种情况。
+  return path.resolve(normalized) === path.resolve(firstNonEmpty(defaultDir));
 }
 
 function loopbackListeningPorts(lsofOutput = "") {
@@ -1920,32 +1934,44 @@ function windowsListeningPortsFromJSON(output = "") {
     .map((value) => String(value)))];
 }
 
+function managedCdpProcessCandidates(processes, userDataDir = "", defaultDir = defaultProfileDir()) {
+  return (Array.isArray(processes) ? processes : []).filter((proc) => {
+    const command = String(proc && proc.command || "");
+    // Chromium 的 renderer/GPU/utility 子进程会继承 --user-data-dir 和
+    // --remote-debugging-port；只有不带 --type= 的浏览器主进程拥有 CDP。
+    if (/(?:^|\s)--type(?:=|\s)/.test(command)) return false;
+    return processMatchesUserDataDir(proc, userDataDir, defaultDir) &&
+      /--remote-debugging-port(?:=|\s)/.test(command);
+  });
+}
+
+function uniqueManagedCdpProcess(processes, userDataDir = "", defaultDir = defaultProfileDir()) {
+  const candidates = managedCdpProcessCandidates(processes, userDataDir, defaultDir);
+  // 只有唯一确认 profile 归属的主进程才可作为发现来源；多个候选说明无法
+  // 判断哪个实例拥有目标 profile，不能猜测端口。
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
 async function managedCdpListURLs(userDataDir = "") {
-  const processes = await listCodexProcesses();
-  const urls = new Set();
-  for (const proc of processes) {
-    if (!processMatchesUserDataDir(proc, userDataDir) || !/--remote-debugging-port(?:=|\s)/.test(String(proc.command || ""))) continue;
-    let ports = [];
-    if (process.platform === "win32") {
-      // Windows 下 Chromium 可能不生成 DevToolsActivePort，改从进程的
-      // loopback 监听端口发现 CDP，和 Hub 的健康检查保持一致。
-      const command = `Get-NetTCPConnection -State Listen -OwningProcess ${Number(proc.pid)} -ErrorAction Stop | Where-Object { $_.LocalAddress -in @('127.0.0.1','::1','::ffff:127.0.0.1') } | Select-Object -ExpandProperty LocalPort -Unique | ConvertTo-Json -Compress`;
-      ports = windowsListeningPortsFromJSON(await commandOutput("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], {
-        timeout: 5000,
-        maxBuffer: 1024 * 1024,
-      }));
-    } else if (process.platform === "darwin" || process.platform === "linux") {
-      const output = await commandOutput("lsof", ["-nP", "-a", "-p", String(proc.pid), "-iTCP", "-sTCP:LISTEN"], {
-        timeout: 4000,
-        maxBuffer: 1024 * 1024,
-      });
-      ports = loopbackListeningPorts(output);
-    }
-    for (const port of ports) {
-      urls.add(`http://127.0.0.1:${port}/json/list`);
-    }
+  const proc = uniqueManagedCdpProcess(await listCodexProcesses(), userDataDir);
+  if (!proc) return [];
+  let ports = [];
+  if (process.platform === "win32") {
+    // Windows 下 Chromium 可能不生成 DevToolsActivePort，改从进程的
+    // loopback 监听端口发现 CDP，和 Hub 的健康检查保持一致。
+    const command = `Get-NetTCPConnection -State Listen -OwningProcess ${Number(proc.pid)} -ErrorAction Stop | Where-Object { $_.LocalAddress -in @('127.0.0.1','::1','::ffff:127.0.0.1') } | Select-Object -ExpandProperty LocalPort -Unique | ConvertTo-Json -Compress`;
+    ports = windowsListeningPortsFromJSON(await commandOutput("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], {
+      timeout: 5000,
+      maxBuffer: 1024 * 1024,
+    }));
+  } else if (process.platform === "darwin" || process.platform === "linux") {
+    const output = await commandOutput("lsof", ["-nP", "-a", "-p", String(proc.pid), "-iTCP", "-sTCP:LISTEN"], {
+      timeout: 4000,
+      maxBuffer: 1024 * 1024,
+    });
+    ports = loopbackListeningPorts(output);
   }
-  return [...urls];
+  return [...new Set(ports.map((port) => `http://127.0.0.1:${port}/json/list`))];
 }
 
 async function isCodexRunning(userDataDir = "") {
@@ -2184,7 +2210,7 @@ class CodexDesktopController extends CdpPageClient {
         return this.launchManagedTarget();
       }
       throw new Error(
-        "当前 Codex 已运行但没有暴露 CDP 端口，无法走 CDP-only 控制。请先关闭 Codex 后让 Prism 管理启动；普通用户优先在 Prism Dashboard 的插件页使用托管启动或手动指定应用路径 / 数据目录，只有开发者模式才建议配置 PRISM_CODEX_CDP_PORT / PRISM_CODEX_CDP_URL。",
+        "当前 Codex 已运行但没有暴露可用的 CDP 端口，无法走 CDP-only 控制。请先关闭 Codex 后让 Prism 管理启动；如同时运行了多个 Codex/ChatGPT 实例，请先关闭多余实例。普通用户优先在 Prism Dashboard 的插件页使用托管启动或手动指定应用路径 / 数据目录，只有开发者模式才建议配置 PRISM_CODEX_CDP_PORT / PRISM_CODEX_CDP_URL。",
       );
     }
     if (allowManagedLaunch) {
@@ -4436,5 +4462,9 @@ module.exports = {
     FLAT_INTELLIGENCE_MODEL_CONTROL_ID,
     windowsProfileDir,
     windowsListeningPortsFromJSON,
+    processUserDataDir,
+    processMatchesUserDataDir,
+    managedCdpProcessCandidates,
+    uniqueManagedCdpProcess,
   },
 };

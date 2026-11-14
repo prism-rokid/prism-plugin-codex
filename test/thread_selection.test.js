@@ -3,6 +3,7 @@ const test = require("node:test");
 
 const {
   CodexDesktopController,
+  defaultProfileDir,
   isCodexMainPageTarget,
   probeCodexMainPage,
   selectCodexMainPageTarget,
@@ -226,6 +227,80 @@ test("CDP listener discovery only accepts loopback ports", () => {
     "ChatGPT 37074 xin.he 62u IPv4 0x3 0t0 TCP *:54418 (LISTEN)",
   ].join("\n"));
   assert.deepEqual(ports, ["54416", "54417"]);
+});
+
+test("普通启动的 Codex 主进程归属平台默认 profile", () => {
+  const defaultDir = defaultProfileDir();
+  const proc = {
+    pid: 101,
+    command: "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT --remote-debugging-port=65213",
+  };
+  assert.equal(cdpTest.processUserDataDir(proc.command), "");
+  assert.equal(cdpTest.processMatchesUserDataDir(proc, defaultDir, defaultDir), true);
+  assert.equal(
+    cdpTest.processMatchesUserDataDir(proc, require("node:path").join(defaultDir, "custom"), defaultDir),
+    false,
+  );
+});
+
+test("--user-data-dir 参数按完整路径精确匹配", () => {
+  const defaultDir = "/tmp/prism-default";
+  const commands = [
+    "--user-data-dir=/tmp/prism-custom",
+    "--user-data-dir /tmp/prism-custom",
+    '--user-data-dir="/tmp/prism-custom"',
+  ];
+  for (const command of commands) {
+    const proc = {
+      pid: 102,
+      command: `/Applications/Codex.app/Contents/MacOS/Codex --remote-debugging-port=0 ${command}`,
+    };
+    assert.equal(cdpTest.processUserDataDir(proc.command), "/tmp/prism-custom");
+    assert.equal(cdpTest.processMatchesUserDataDir(proc, "/tmp/prism-custom", defaultDir), true);
+    assert.equal(cdpTest.processMatchesUserDataDir(proc, "/tmp/prism-custom-other", defaultDir), false);
+    assert.equal(cdpTest.processMatchesUserDataDir(proc, defaultDir, defaultDir), false);
+  }
+
+  // macOS 默认 profile 路径包含空格，ps 输出不会给它加引号。
+  const spaced = "/tmp/prism custom";
+  const spacedProc = {
+    pid: 103,
+    command: `/Applications/Codex.app/Contents/MacOS/Codex --user-data-dir=${spaced} --remote-debugging-port=0`,
+  };
+  assert.equal(cdpTest.processUserDataDir(spacedProc.command), spaced);
+  assert.equal(cdpTest.processMatchesUserDataDir(spacedProc, spaced, defaultDir), true);
+  assert.equal(cdpTest.processMatchesUserDataDir(spacedProc, `${spaced}-other`, defaultDir), false);
+});
+
+test("多个候选主进程时不猜测 CDP 端口", () => {
+  const defaultDir = "/tmp/prism-default";
+  const bare = (pid) => ({
+    pid,
+    command: "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT --remote-debugging-port=0",
+  });
+  const one = bare(1);
+  assert.deepEqual(cdpTest.managedCdpProcessCandidates([one], defaultDir, defaultDir), [one]);
+  assert.equal(cdpTest.uniqueManagedCdpProcess([one], defaultDir, defaultDir), one);
+  assert.equal(cdpTest.uniqueManagedCdpProcess([one, bare(2)], defaultDir, defaultDir), null);
+  assert.equal(cdpTest.uniqueManagedCdpProcess([], defaultDir, defaultDir), null);
+  assert.equal(
+    cdpTest.uniqueManagedCdpProcess([{ pid: 3, command: "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT" }], defaultDir, defaultDir),
+    null,
+  );
+
+  // Chromium 子进程会继承主进程的 profile 和 debug 参数，不能算作候选。
+  const renderer = {
+    pid: 4,
+    command: `/Applications/ChatGPT.app/Contents/Frameworks/Helpers/Codex (Aperitif Renderer) --type=renderer --user-data-dir=${defaultDir} --remote-debugging-port=0`,
+  };
+  assert.deepEqual(cdpTest.managedCdpProcessCandidates([one, renderer], defaultDir, defaultDir), [one]);
+});
+
+test("CDP listener discovery uses only a uniquely confirmed main process", () => {
+  const source = require("node:fs").readFileSync(require.resolve("../codex_cdp.js"), "utf8");
+  const discovery = source.slice(source.indexOf("async function managedCdpListURLs"), source.indexOf("async function isCodexRunning"));
+  assert.match(discovery, /uniqueManagedCdpProcess\(await listCodexProcesses\(\), userDataDir\)/);
+  assert.doesNotMatch(discovery, /for \(const proc of processes\)/);
 });
 
 test("Windows CDP listener parsing accepts scalar and array ports", () => {
