@@ -1861,7 +1861,9 @@ async function listCodexProcesses() {
       .filter(Boolean);
   }
   if (process.platform === "win32") {
-    const modern = await commandOutput("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "Get-CimInstance Win32_Process -Filter \"Name='Codex.exe'\" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"], {
+    // Microsoft Store 版本的 Codex 主进程名称通常是 ChatGPT.exe，不能只查 Codex.exe。
+    const processFilter = "Name='Codex.exe' OR Name='ChatGPT.exe'";
+    const modern = await commandOutput("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `Get-CimInstance Win32_Process -Filter \"${processFilter}\" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress`], {
       timeout: 8000,
       maxBuffer: 2 * 1024 * 1024,
     });
@@ -1871,7 +1873,7 @@ async function listCodexProcesses() {
         return (Array.isArray(parsed) ? parsed : [parsed]).map((row) => ({ pid: Number(row.ProcessId), command: firstNonEmpty(row.CommandLine) })).filter((row) => row.pid);
       } catch {}
     }
-    const output = await commandOutput("cmd.exe", ["/c", "wmic process where \"name='Codex.exe'\" get ProcessId,CommandLine /format:list"], {
+    const output = await commandOutput("cmd.exe", ["/c", `wmic process where \"${processFilter}\" get ProcessId,CommandLine /format:list`], {
       timeout: 8000,
       maxBuffer: 2 * 1024 * 1024,
     });
@@ -1902,17 +1904,44 @@ function loopbackListeningPorts(lsofOutput = "") {
   return [...ports];
 }
 
+function windowsListeningPortsFromJSON(output = "") {
+  const text = String(output || "").trim();
+  if (!text || text === "null") return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  const values = Array.isArray(parsed) ? parsed : [parsed];
+  return [...new Set(values
+    .map((value) => Number(value))
+    .filter((value) => Number.isInteger(value) && value >= 1 && value <= 65535)
+    .map((value) => String(value)))];
+}
+
 async function managedCdpListURLs(userDataDir = "") {
-  if (process.platform !== "darwin" && process.platform !== "linux") return [];
   const processes = await listCodexProcesses();
   const urls = new Set();
   for (const proc of processes) {
     if (!processMatchesUserDataDir(proc, userDataDir) || !/--remote-debugging-port(?:=|\s)/.test(String(proc.command || ""))) continue;
-    const output = await commandOutput("lsof", ["-nP", "-a", "-p", String(proc.pid), "-iTCP", "-sTCP:LISTEN"], {
-      timeout: 4000,
-      maxBuffer: 1024 * 1024,
-    });
-    for (const port of loopbackListeningPorts(output)) {
+    let ports = [];
+    if (process.platform === "win32") {
+      // Windows 下 Chromium 可能不生成 DevToolsActivePort，改从进程的
+      // loopback 监听端口发现 CDP，和 Hub 的健康检查保持一致。
+      const command = `Get-NetTCPConnection -State Listen -OwningProcess ${Number(proc.pid)} -ErrorAction Stop | Where-Object { $_.LocalAddress -in @('127.0.0.1','::1','::ffff:127.0.0.1') } | Select-Object -ExpandProperty LocalPort -Unique | ConvertTo-Json -Compress`;
+      ports = windowsListeningPortsFromJSON(await commandOutput("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], {
+        timeout: 5000,
+        maxBuffer: 1024 * 1024,
+      }));
+    } else if (process.platform === "darwin" || process.platform === "linux") {
+      const output = await commandOutput("lsof", ["-nP", "-a", "-p", String(proc.pid), "-iTCP", "-sTCP:LISTEN"], {
+        timeout: 4000,
+        maxBuffer: 1024 * 1024,
+      });
+      ports = loopbackListeningPorts(output);
+    }
+    for (const port of ports) {
       urls.add(`http://127.0.0.1:${port}/json/list`);
     }
   }
@@ -4406,5 +4435,6 @@ module.exports = {
     EFFORT_CONTROL_ID,
     FLAT_INTELLIGENCE_MODEL_CONTROL_ID,
     windowsProfileDir,
+    windowsListeningPortsFromJSON,
   },
 };

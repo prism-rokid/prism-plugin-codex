@@ -195,6 +195,11 @@ test("CDP capability probe is a bounded main-page reachability check", () => {
   assert.doesNotMatch(probe, /waitForReady/);
 });
 
+test("Windows process discovery includes the Microsoft Store Codex host", () => {
+  const source = require("node:fs").readFileSync(require.resolve("../codex_cdp.js"), "utf8");
+  assert.match(source, /Name='Codex\.exe' OR Name='ChatGPT\.exe'/);
+});
+
 test("CDP capability probe tolerates the DevTools target publication race", async () => {
   const originalFetch = global.fetch;
   let calls = 0;
@@ -221,6 +226,13 @@ test("CDP listener discovery only accepts loopback ports", () => {
     "ChatGPT 37074 xin.he 62u IPv4 0x3 0t0 TCP *:54418 (LISTEN)",
   ].join("\n"));
   assert.deepEqual(ports, ["54416", "54417"]);
+});
+
+test("Windows CDP listener parsing accepts scalar and array ports", () => {
+  assert.deepEqual(cdpTest.windowsListeningPortsFromJSON("54416"), ["54416"]);
+  assert.deepEqual(cdpTest.windowsListeningPortsFromJSON("[54416,54417,54416]"), ["54416", "54417"]);
+  assert.deepEqual(cdpTest.windowsListeningPortsFromJSON("[0,65536,\"bad\",54418]"), ["54418"]);
+  assert.deepEqual(cdpTest.windowsListeningPortsFromJSON(""), []);
 });
 
 test("approval discovery supports Codex's inline approval surface", () => {
