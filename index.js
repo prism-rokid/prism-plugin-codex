@@ -62,7 +62,7 @@ const THREAD_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 const DEFAULT_MODEL_OPTIONS = [];
 let sessionFilesCache = { at: 0, files: [] };
 let stateQueryTail = Promise.resolve();
-let sessionListCache = { at: 0, threads: null, inFlight: null };
+let sessionListCache = { at: 0, snapshot: null, inFlight: null };
 let codexDesktopControllerPromise = null;
 const desktopWatchSubscribers = new Map();
 const agentUsageSubscribers = new Set();
@@ -88,6 +88,7 @@ const deferredDesktopWatchBursts = new Map();
 const DESKTOP_WATCH_UNAVAILABLE_AFTER_POLLS = 3;
 let desktopWatchState = createDesktopWatchState();
 let desktopDirectoryState = createDesktopDirectoryState();
+let desktopDirectoryAttachmentEpoch = 0;
 let desktopDirectoryWatchers = [];
 let desktopDirectoryPollTimer = null;
 const DESKTOP_WATCH_BURST_DELAYS_MS = [0, 180, 500, 1100, 2200, 4500];
@@ -658,6 +659,7 @@ function createDesktopDirectoryState() {
   return {
     initialized: false,
     threads: new Map(),
+    attachedThreadIDs: new Set(),
     debounceTimer: null,
     running: false,
     dirty: false,
@@ -1414,6 +1416,45 @@ function isDesktopVisibleThread(item, sessionIndexMap) {
   return updatedAtMs > 0 && Date.now() - updatedAtMs < 10 * 60 * 1000;
 }
 
+const THREAD_ATTACHMENT_COLUMN = "attached_thread_parent_id";
+
+async function threadAttachmentColumn() {
+  const columns = await queryStateRows(
+    `SELECT name FROM pragma_table_info('threads') WHERE name COLLATE NOCASE IN ('id', '${THREAD_ATTACHMENT_COLUMN}');`,
+  );
+  if (columns.length === 0 && stateDBPath()) {
+    throw new Error("Codex state database does not contain a readable threads table");
+  }
+  return columns.some(({ name }) => name.toLowerCase() === THREAD_ATTACHMENT_COLUMN)
+    ? THREAD_ATTACHMENT_COLUMN : "NULL";
+}
+
+async function isAttachedSideChat(threadID) {
+  if (!isThreadID(threadID)) return false;
+  const attachment = await threadAttachmentColumn();
+  const [row] = await queryStateRows(`
+    SELECT COALESCE(${attachment}, '') <> '' AS attached
+    FROM threads
+    WHERE id = '${sqliteEscape(threadID)}';
+  `);
+  if (!row) {
+    throw new Error("control_target_stale: Codex thread not found in state database");
+  }
+  return Number(row.attached) === 1;
+}
+
+function desktopDirectoryAttachedSince(threadID, attachmentEpoch) {
+  // 后续目录刷新确认的附属关系优先于旧查询结果和已排队的事件。
+  return desktopDirectoryAttachmentEpoch !== attachmentEpoch
+    && desktopDirectoryState.attachedThreadIDs.has(threadID);
+}
+
+async function assertRemoteThreadControlAllowed(threadID) {
+  if (await isAttachedSideChat(threadID)) {
+    throw new Error("control_target_stale: Codex attached side chats are read-only remotely");
+  }
+}
+
 async function readThreadsFromState(limit = 0, options = {}) {
   const startedAt = Date.now();
   const sessionIndexMap = new Map(readSessionIndex().map((item) => [item.id, item.title]));
@@ -1421,30 +1462,34 @@ async function readThreadsFromState(limit = 0, options = {}) {
   const queryLimit = Number.isFinite(requestedLimit) && requestedLimit > 0
     ? Math.max(1, Math.floor(requestedLimit))
     : SESSION_LIST_DEFAULT_LIMIT;
-  const sqlLimit = `\n    LIMIT ${Math.max(queryLimit, Math.min(SESSION_LIST_DEFAULT_LIMIT, queryLimit * 4))}`;
+  const candidateLimit = Math.max(queryLimit, Math.min(SESSION_LIST_DEFAULT_LIMIT, queryLimit * 4));
+  const attachment = await threadAttachmentColumn();
+  const directoryColumns = [
+    "id",
+    `substr(title, 1, ${SESSION_LIST_TITLE_MAX_CHARS}) AS title`,
+    "cwd", "rollout_path", "tokens_used", "model_provider", "model", "reasoning_effort",
+    "sandbox_policy", "approval_mode", "memory_mode", "agent_nickname", "thread_source",
+    "updated_at_ms", "created_at_ms", "recency_at_ms",
+  ];
+  // 在同一个 SQLite 快照中分页读取主线程详情，并仅汇总附属线程的 ID。
   const rows = await queryStateRows(`
-    SELECT
-      id,
-      substr(title, 1, ${SESSION_LIST_TITLE_MAX_CHARS}) AS title,
-      cwd,
-      rollout_path,
-      tokens_used,
-      model_provider,
-      model,
-      reasoning_effort,
-      sandbox_policy,
-      approval_mode,
-      memory_mode,
-      agent_nickname,
-      thread_source,
-      updated_at_ms,
-      created_at_ms,
-      recency_at_ms
-    FROM threads
-    WHERE archived = 0
-    ORDER BY recency_at_ms DESC, updated_at_ms DESC${sqlLimit};
+    WITH directory_page AS (
+      SELECT ${directoryColumns.join(", ")}
+      FROM threads
+      WHERE archived = 0 AND COALESCE(${attachment}, '') = ''
+      ORDER BY recency_at_ms DESC, updated_at_ms DESC
+      LIMIT ${candidateLimit}
+    )
+    SELECT *, NULL AS attached_thread_ids FROM directory_page
+    UNION ALL
+    SELECT ${directoryColumns.map(() => "NULL").join(", ")}, json_group_array(id)
+    FROM threads WHERE ${attachment} <> ''
+    ORDER BY recency_at_ms DESC, updated_at_ms DESC;
   `);
+  const attachedIDsJSON = rows.find((row) => row.attached_thread_ids !== null)?.attached_thread_ids;
+  const attachedThreadIDs = new Set(attachedIDsJSON ? JSON.parse(attachedIDsJSON) : []);
   let items = rows
+    .filter((row) => row.attached_thread_ids === null)
     .map((row) => rowToThreadItem(row, sessionIndexMap.get(firstNonEmpty(row && row.id)) || ""))
     .map(enrichThreadItemWithRollout)
     .filter((item) => isThreadID(item.id) && isUserVisibleThread(item) && isDesktopVisibleThread(item, sessionIndexMap))
@@ -1458,7 +1503,7 @@ async function readThreadsFromState(limit = 0, options = {}) {
     include_desktop_snapshot: options && options.includeDesktopSnapshot ? "true" : "false",
     count: items.length,
   });
-  return items;
+  return { threads: items, attachedThreadIDs };
 }
 
 // Thread metadata cache. findThreadByID runs a sqlite3 subprocess (queryStateRows) plus a
@@ -4660,11 +4705,12 @@ async function describeCodexMenuSession(threadID = "", owner = null, options = {
     if (ownerKind === "queue_item" && !queueItemID) {
       throw new Error("control_target_stale: menu owner requires queue_item_id");
     }
-    const controller = options.controller || await codexDesktopController();
     const draftID = String(options.draftID || "").trim();
     if (ownerKind === "queue_item" && draftID) {
       throw new Error("draft_stale: queue menus are unavailable for a desktop draft");
     }
+    if (!draftID) await assertRemoteThreadControlAllowed(threadID);
+    const controller = options.controller || await codexDesktopController();
     if (draftID) {
       await assertActiveMobileDraft(draftID);
     } else {
@@ -4721,6 +4767,7 @@ async function applyCodexMenuSession(threadID = "", target = null, options = {})
     const session = resolvePluginMenuSession(menuSessionID, threadID, draftID);
     const entry = session.entries.find((candidate) => candidate && candidate.entry_id === entryID && candidate.available !== false);
     if (!entry) throw new Error("control_target_stale: menu entry is no longer available");
+    if (!draftID) await assertRemoteThreadControlAllowed(threadID);
     const controller = options.controller || await codexDesktopController();
     if (draftID) {
       await assertActiveMobileDraft(draftID);
@@ -5116,6 +5163,7 @@ async function selectCodexConversation(threadID = "") {
     throw new Error("codex conversation.select requires a resolved Codex thread id");
   }
   return runExclusiveDesktopControl(async () => {
+    await assertRemoteThreadControlAllowed(threadID);
     const controller = await codexDesktopController();
     const alreadySelected = await controller.isThreadSelected(threadID);
     // The owning project cwd lets the Windows sidebar switch expand a collapsed
@@ -5427,6 +5475,7 @@ async function controlCodexQueue(threadID = "", action = "", target = null) {
   }
   const itemID = queueItemIDFromTarget(target);
   logControlDebug("queue.start", { action: normalizedAction, thread_id: threadID, queue_item_id: itemID });
+  await assertRemoteThreadControlAllowed(threadID);
   const controller = await codexDesktopController();
   logControlDebug("queue.controller_ready", {
     action: normalizedAction, thread_id: threadID, queue_item_id: itemID, cost_ms: Date.now() - startedAt,
@@ -5489,6 +5538,7 @@ async function applyCodexInteractiveSurface(threadID = "", target = null) {
     if (!surfaceID || !actionID) {
       throw new Error("control_target_stale: interactive.surface.apply requires surface_id and action_id from the current detail");
     }
+    await assertRemoteThreadControlAllowed(threadID);
     const controller = await codexDesktopController();
     await selectRequiredCodexThread(controller, threadID);
     const currentSurface = await controller.readInteractiveSurface().catch(() => null);
@@ -5535,6 +5585,7 @@ async function controlCodexPlanMode(threadID = "", target = null) {
   return runExclusiveDesktopControl(async () => {
     if (!isThreadID(threadID)) throw new Error("codex plan.set requires a resolved Codex thread id");
     const enabled = booleanControlTarget(target, "enabled");
+    await assertRemoteThreadControlAllowed(threadID);
     const controller = await codexDesktopController();
     await selectRequiredCodexThread(controller, threadID);
     const live = await controller.goalPlanState();
@@ -5560,6 +5611,7 @@ async function controlCodexGoal(threadID = "", action = "", target = null) {
     if (normalized === "goal.edit") {
       throw new Error("control_unsupported: Codex goal editing is not safely available remotely");
     }
+    await assertRemoteThreadControlAllowed(threadID);
     const controller = await codexDesktopController();
     await selectRequiredCodexThread(controller, threadID);
     const live = await controller.goalPlanState();
@@ -5704,8 +5756,8 @@ async function resolveApproval(req) {
     throw new Error("codex resolveApproval requires an action id");
   }
   const input = String(firstNonEmpty(req && req.Input, req && req.input)).trim();
+  await assertRemoteThreadControlAllowed(threadID);
   const controller = await codexDesktopController();
-  const thread = await findThreadByID(threadID).catch(() => null);
   await selectRequiredCodexThread(controller, threadID);
   await controller.resolveApproval(actionID, input);
 }
@@ -5714,6 +5766,7 @@ async function describeCodexControls(threadID = "", options = {}) {
   if (!isThreadID(threadID)) {
     throw new Error("codex controls.describe requires a resolved Codex thread id");
   }
+  await assertRemoteThreadControlAllowed(threadID);
   const controller = await codexDesktopController();
   await selectRequiredCodexThread(controller, threadID);
   const runtimeSnapshot = await currentDesktopRuntimeSnapshot().catch(() => null);
@@ -5827,7 +5880,7 @@ function toSession(threadID, cwd = "", metadata = {}) {
 
 async function listSessions() {
   const startedAt = Date.now();
-  const threads = await readSessionListSnapshot();
+  const { threads } = await readSessionListSnapshot();
   logTiming("listSessions", startedAt, {
     count: threads.length,
   });
@@ -5848,43 +5901,46 @@ async function listSessions() {
 }
 
 async function readSessionListSnapshot(limit = 0, options = {}) {
+  const cache = sessionListCache;
   const nowMs = Date.now();
-  if (!options.force && Array.isArray(sessionListCache.threads)
-      && nowMs - sessionListCache.at < SESSION_LIST_CACHE_MS) {
-    return sessionListCache.threads;
+  if (!options.force && cache.snapshot && nowMs - cache.at < SESSION_LIST_CACHE_MS) {
+    return cache.snapshot;
   }
-  if (sessionListCache.inFlight) {
-    return sessionListCache.inFlight;
+  if (cache.inFlight) {
+    return cache.inFlight;
   }
 
   const read = (async () => {
-    let threads = await readThreadsFromState(limit);
+    let snapshot = await readThreadsFromState(limit);
     let indexedThreads = readSessionIndex();
-    if (threads.length === 0 && indexedThreads.length === 0) {
+    if (snapshot.threads.length === 0 && indexedThreads.length === 0) {
       // Codex updates state_5.sqlite and session_index.jsonl independently.
       // A real empty list must remain empty across two complete observations;
       // otherwise this is an update window, not an authoritative deletion.
       await sleep(EMPTY_SESSION_LIST_CONFIRM_DELAY_MS);
-      threads = await readThreadsFromState(limit);
+      snapshot = await readThreadsFromState(limit);
       indexedThreads = readSessionIndex();
     }
-    // An empty result is a complete snapshot only when the independent Codex
-    // session index is also empty. Returning [] while that index still has
-    // entries would erase a valid remote index during a transient SQLite read.
-    if (threads.length === 0 && indexedThreads.length > 0) {
-      throw new Error(`Codex session list incomplete: state query returned no visible threads while session index has ${indexedThreads.length}`);
+    if (snapshot.threads.length === 0) {
+      // 附属关系和原生归档可以解释侧聊过滤后的空目录。未知索引项仍触发完整性保护。
+      let unmatched = indexedThreads.filter(({ id }) => !snapshot.attachedThreadIDs.has(id));
+      if (snapshot.attachedThreadIDs.size > 0 && unmatched.length > 0) {
+        const archived = new Set((await queryStateRows("SELECT id FROM threads WHERE archived <> 0;")).map(({ id }) => id));
+        unmatched = unmatched.filter(({ id }) => !archived.has(id));
+      }
+      if (unmatched.length > 0) {
+        throw new Error(`Codex session list incomplete: state query returned no visible threads while session index has ${indexedThreads.length}`);
+      }
     }
-    sessionListCache.at = Date.now();
-    sessionListCache.threads = threads;
-    return threads;
+    cache.at = Date.now();
+    cache.snapshot = snapshot;
+    return snapshot;
   })();
-  sessionListCache.inFlight = read;
+  cache.inFlight = read;
   try {
     return await read;
   } finally {
-    if (sessionListCache.inFlight === read) {
-      sessionListCache.inFlight = null;
-    }
+    cache.inFlight = null;
   }
 }
 
@@ -5914,6 +5970,7 @@ async function send(session, msg) {
       throw new Error("codex send requires text or attachments");
     }
     if (isThreadID(threadID)) {
+      await assertRemoteThreadControlAllowed(threadID);
       runContext = {
         thread_id: threadID,
         started_at: sendStartedAt,
@@ -6221,24 +6278,34 @@ function desktopRunFileWatchStop(threadID) {
 
 async function desktopRunFileWatchPoll(threadID) {
   const tracker = desktopRunFileWatchers.get(threadID);
-  if (!tracker) return;
-  let file = tracker.file;
-  if (!file || !fs.existsSync(file)) {
-    file = tracker.file = await findRolloutFile(threadID).catch(() => "");
-    if (file) {
-      try {
-        tracker.offset = fs.readFileSync(file, "utf8").length;
-      } catch {
-        tracker.offset = 0;
+  if (!tracker || tracker.polling) return;
+  tracker.polling = true;
+  try {
+    let file = tracker.file;
+    if (!file || !fs.existsSync(file)) {
+      file = tracker.file = await findRolloutFile(threadID).catch(() => "");
+      if (file) {
+        try {
+          tracker.offset = fs.readFileSync(file, "utf8").length;
+        } catch {
+          tracker.offset = 0;
+        }
       }
     }
-  }
-  const chunk = file ? summarizeRolloutChunk(file, tracker.offset) : null;
-  const decision = desktopRunFileWatchEvaluate(tracker, chunk, Date.now());
-  if (decision.action === "continue") return;
-  desktopRunFileWatchStop(threadID);
-  if (decision.action === "terminal") {
-    await emitDesktopTerminalRunEvents(threadID, decision.status, null, null);
+    const chunk = file ? summarizeRolloutChunk(file, tracker.offset) : null;
+    const decision = desktopRunFileWatchEvaluate(tracker, chunk, Date.now());
+    if (decision.action === "continue") return;
+    if (decision.action === "terminal") {
+      await emitDesktopTerminalRunEvents(threadID, decision.status, null, null);
+    }
+    if (desktopRunFileWatchers.get(threadID) === tracker) desktopRunFileWatchStop(threadID);
+  } catch (error) {
+    // 附属关系暂时读不到时保留读取位置，由已有的轮询重试至原定超时。
+    if (Date.now() - tracker.startedAt >= DESKTOP_RUN_FILE_WATCH_TIMEOUT_MS
+        && desktopRunFileWatchers.get(threadID) === tracker) desktopRunFileWatchStop(threadID);
+    throw error;
+  } finally {
+    tracker.polling = false;
   }
 }
 
@@ -6268,41 +6335,47 @@ function desktopTerminalRunEvent(threadID, status, summary, sessionHint, detailS
         endpoint: deepLink(threadID),
         cwd: firstNonEmpty(sessionHint && sessionHint.cwd),
       },
-      session_hint: sessionHint && typeof sessionHint === "object" ? sessionHint : desktopSessionHint(threadID, {}, status),
+      session_hint: sessionHint || undefined,
       detail_snapshot: detailSnapshot || undefined,
     },
   };
 }
 
-async function emitDesktopTerminalRunEvents(threadID, status, detailSnapshot, sessionHint, { requireFresh = false } = {}) {
+async function emitDesktopTerminalRunEvents(threadID, status, detailSnapshot, sessionHint, options = {}) {
+  if (!["completed", "failed", "interrupted"].includes(status)) return;
+  const tracker = desktopRunFileWatchers.get(threadID);
   const evidenceInfo = await rolloutEvidence(threadID);
-  if (requireFresh && !desktopTerminalFreshEnough(evidenceInfo.mtimeMs)) {
+  if (options.requireFresh && !desktopTerminalFreshEnough(evidenceInfo.mtimeMs)) {
     return;
   }
   const terminal = summarizeRolloutChunk(evidenceInfo.path);
   if (!terminal.terminal || !terminal.terminalID) return;
   const nativeStatus = terminal.failed ? "failed" : terminal.interrupted ? "interrupted" : "completed";
-  if (nativeStatus !== status) return;
-  const normalized = desktopTerminalTransition(threadID, nativeStatus, terminal.terminalID, terminal.terminalAt);
-  if (!normalized) return;
-  persistDesktopTerminalRuns();
-  desktopRunFileWatchStop(threadID);
+  if (nativeStatus !== status || desktopTerminalRunEmitted.get(threadID)?.terminalID === terminal.terminalID) return;
   const run = detailSnapshot && typeof detailSnapshot.run === "object" ? detailSnapshot.run : null;
-  const runSummary = run && String(run.status || "").toLowerCase() === normalized ? firstNonEmpty(run.summary) : "";
+  const runSummary = run && String(run.status || "").toLowerCase() === nativeStatus ? firstNonEmpty(run.summary) : "";
   let latestSummary = "";
-  if (normalized === "completed") {
+  if (nativeStatus === "completed") {
     const latest = await latestAssistantSummary(threadID).catch(() => null);
     latestSummary = firstNonEmpty(latest && latest.summary);
   }
+  const attachmentEpoch = desktopDirectoryAttachmentEpoch;
+  const attachedInState = await isAttachedSideChat(threadID);
+  const attached = attachedInState || desktopDirectoryAttachedSince(threadID, attachmentEpoch);
+  const normalized = desktopTerminalTransition(threadID, nativeStatus, terminal.terminalID, terminal.terminalAt);
+  if (!normalized) return;
+  persistDesktopTerminalRuns();
+  if (tracker && desktopRunFileWatchers.get(threadID) === tracker) desktopRunFileWatchStop(threadID);
   const event = desktopTerminalRunEvent(
     threadID,
     normalized,
     desktopTerminalRunSummary(normalized, runSummary, latestSummary),
-    sessionHint,
+    attached ? null : (sessionHint || desktopSessionHint(threadID, {}, status)),
     detailSnapshot,
     terminal.terminalID,
   );
   for (const subscriber of desktopTerminalRunReceivers(threadID)) {
+    if (attached && subscriber.pluginWide) continue;
     emitDesktopWatchEvent(subscriber, event);
   }
 }
@@ -6411,12 +6484,7 @@ function desktopSessionHint(threadID, snapshot = {}, status = "") {
 function emitDesktopWatchDetail(subscriber, threadID, detailSnapshot, status, summary, sessionHint = null) {
   if (!subscriber || !isThreadID(threadID) || !detailSnapshot) return;
   subscriber.detailSnapshot = detailSnapshot;
-  const hint = sessionHint && typeof sessionHint === "object"
-    ? sessionHint
-    : subscriber.sessionHint && typeof subscriber.sessionHint === "object"
-      ? subscriber.sessionHint
-      : desktopSessionHint(threadID, {}, status);
-  subscriber.sessionHint = hint;
+  subscriber.sessionHint = sessionHint;
   emitDesktopWatchEvent(subscriber, {
     ID: `desktop-watch-${threadID}-${Date.now()}`,
     Type: "desktop.state.changed",
@@ -6433,9 +6501,9 @@ function emitDesktopWatchDetail(subscriber, threadID, detailSnapshot, status, su
         native_thread_id: threadID,
         surface: "codex-desktop",
         endpoint: deepLink(threadID),
-        cwd: firstNonEmpty(hint.cwd),
+        cwd: firstNonEmpty(sessionHint && sessionHint.cwd),
       },
-      session_hint: hint,
+      session_hint: sessionHint || undefined,
     },
   });
 }
@@ -6449,7 +6517,7 @@ function emitDesktopWatchArchived(threadID) {
   for (const key of historyTurnRevisionCache.keys()) {
     if (key.startsWith(`${threadID}:`)) historyTurnRevisionCache.delete(key);
   }
-  sessionListCache = { at: 0, threads: null, inFlight: null };
+  sessionListCache = { at: 0, snapshot: null, inFlight: null };
   const hint = {
     plugin_id: "codex",
     native_session_id: threadID,
@@ -6561,23 +6629,27 @@ async function reconcileDesktopDirectoryFromStorage() {
   desktopDirectoryState.running = true;
   desktopDirectoryState.dirty = false;
   try {
-    const threads = await readSessionListSnapshot(0, { force: true });
+    const { threads, attachedThreadIDs } = await readSessionListSnapshot(0, { force: true });
     const diff = desktopDirectoryDiff(desktopDirectoryState.threads, threads);
     const initial = !desktopDirectoryState.initialized;
+    const previousAttachedThreadIDs = desktopDirectoryState.attachedThreadIDs;
+    const attachmentsChanged = attachedThreadIDs.size !== previousAttachedThreadIDs.size
+      || [...attachedThreadIDs].some((threadID) => !previousAttachedThreadIDs.has(threadID));
     desktopDirectoryState.initialized = true;
     desktopDirectoryState.threads = diff.next;
+    if (attachmentsChanged) {
+      desktopDirectoryState.attachedThreadIDs = attachedThreadIDs;
+      desktopDirectoryAttachmentEpoch += 1;
+    }
     desktopDirectoryState.retryAttempt = 0;
     if (initial) {
       emitDesktopDirectoryReconciled();
       return;
     }
-    for (const thread of [...diff.added, ...diff.changed]) {
-      emitDesktopDirectoryIndexChanged(thread);
-    }
-    let requiresCompleteRebuild = false;
+    let requiresCompleteRebuild = attachmentsChanged;
     for (const thread of diff.removed) {
       const threadID = firstNonEmpty(thread && thread.id);
-      if (await threadArchivedInState(threadID)) {
+      if (!attachedThreadIDs.has(threadID) && await threadArchivedInState(threadID)) {
         emitDesktopWatchArchived(threadID);
       } else {
         // A successful complete snapshot proves the item is gone, but only
@@ -6585,7 +6657,13 @@ async function reconcileDesktopDirectoryFromStorage() {
         requiresCompleteRebuild = true;
       }
     }
-    if (requiresCompleteRebuild) emitDesktopDirectoryReconciled();
+    if (requiresCompleteRebuild) {
+      emitDesktopDirectoryReconciled();
+    } else {
+      for (const thread of [...diff.added, ...diff.changed]) {
+        emitDesktopDirectoryIndexChanged(thread);
+      }
+    }
   } catch (error) {
     const retryDelay = DIRECTORY_WATCH_RETRY_DELAYS_MS[desktopDirectoryState.retryAttempt];
     desktopDirectoryState.retryAttempt += 1;
@@ -6639,7 +6717,7 @@ function ensureDesktopDirectoryWatchRunning() {
       const recursive = directory === SESSION_ROOT && (process.platform === "darwin" || process.platform === "win32");
       const watcher = fs.watch(directory, { recursive }, (eventType, filename) => {
         if (!directoryWatchEventIsRelevant(directory, filename)) return;
-        sessionListCache = { at: 0, threads: null, inFlight: null };
+        sessionListCache = { at: 0, snapshot: null, inFlight: null };
         requestDesktopDirectoryRefresh();
       });
       watcher.on("error", (error) => {
@@ -6660,11 +6738,15 @@ function stopDesktopDirectoryWatchWhenIdle() {
   for (const watcher of desktopDirectoryWatchers) watcher.close();
   desktopDirectoryWatchers = [];
   if (desktopDirectoryState.debounceTimer) clearTimeout(desktopDirectoryState.debounceTimer);
+  const attachedThreadIDs = desktopDirectoryState.attachedThreadIDs;
   desktopDirectoryState = createDesktopDirectoryState();
+  // 全局订阅退出后，存活的 scoped 队列仍须用已确认关系过滤旧事件。
+  if (desktopWatchSubscribers.size > 0) desktopDirectoryState.attachedThreadIDs = attachedThreadIDs;
 }
 
-function emitDesktopWatchStale(subscriber, threadID) {
+function emitDesktopWatchStale(subscriber, threadID, attached) {
   if (!subscriber || !isThreadID(threadID)) return;
+  if (attached && subscriber.pluginWide) return;
   const previous = subscriber.detailSnapshot && typeof subscriber.detailSnapshot === "object"
     ? subscriber.detailSnapshot
     : {};
@@ -6678,10 +6760,13 @@ function emitDesktopWatchStale(subscriber, threadID) {
   };
   subscriber.signature = "";
   subscriber.detailSnapshot = staleSnapshot;
-  emitDesktopWatchDetail(subscriber, threadID, staleSnapshot, "idle", "Codex 会话已切到其他桌面窗口。", subscriber.sessionHint);
+  const previousHint = subscriber.sessionHint;
+  const hint = attached ? null : (previousHint?.native_thread_id === threadID
+    ? previousHint : desktopSessionHint(threadID, {}, "idle"));
+  emitDesktopWatchDetail(subscriber, threadID, staleSnapshot, "idle", "Codex 会话已切到其他桌面窗口。", hint);
 }
 
-function emitDesktopWatchUnavailable(subscriber) {
+function emitDesktopWatchUnavailable(subscriber, pluginWideThreadID) {
   if (!subscriber) return;
   subscriber.signature = "";
   emitDesktopWatchEvent(subscriber, {
@@ -6693,10 +6778,10 @@ function emitDesktopWatchUnavailable(subscriber) {
     Payload: {
       watcher: "foreground",
       code: "foreground_watcher_unavailable",
-      native_session: subscriber.pluginWide && isThreadID(desktopWatchState.lastValidThreadID) ? {
+      native_session: subscriber.pluginWide && isThreadID(pluginWideThreadID) ? {
         plugin_id: "codex",
-        native_session_id: desktopWatchState.lastValidThreadID,
-        native_thread_id: desktopWatchState.lastValidThreadID,
+        native_session_id: pluginWideThreadID,
+        native_thread_id: pluginWideThreadID,
         surface: "codex-desktop",
         endpoint: deepLink(desktopWatchState.lastValidThreadID),
       } : undefined,
@@ -6704,11 +6789,13 @@ function emitDesktopWatchUnavailable(subscriber) {
   });
 }
 
-function reportDesktopWatchFailure() {
+async function reportDesktopWatchFailure() {
   const transition = observeDesktopWatchForeground(desktopWatchState, "");
   if (!transition.becameUnavailable) return;
+  const lastThreadID = desktopWatchState.lastValidThreadID;
   for (const subscriber of desktopWatchSubscribers.values()) {
-    emitDesktopWatchUnavailable(subscriber);
+    // 不可用通知依靠最后有效会话路由，不参与目录准入，也无需查询附属关系。
+    emitDesktopWatchUnavailable(subscriber, lastThreadID);
   }
 }
 
@@ -6796,7 +6883,7 @@ async function pollDesktopWatch() {
         }
         return;
       }
-      reportDesktopWatchFailure();
+      await reportDesktopWatchFailure();
       return;
     }
 	if (mobileDrafts.size > 0) {
@@ -6817,26 +6904,42 @@ async function pollDesktopWatch() {
     const indexSignature = desktopIndexWatchSignature(snapshot, status);
     const detailSnapshot = detailSnapshotFromDesktopWatch(threadID, snapshot, messagesSignature, interactiveSurface);
     if (!detailSnapshot) {
-      reportDesktopWatchFailure();
+      await reportDesktopWatchFailure();
       return;
     }
-    const sessionHint = desktopSessionHint(threadID, snapshot, status);
     if (transition.switched) {
+      const attachmentEpoch = desktopDirectoryAttachmentEpoch;
+      const attachedInState = await isAttachedSideChat(transition.previousThreadID).catch((error) => {
+        // 前台切换已确认，关系读取失败也必须让旧详情失效，且不得带目录提示。
+        console.error(`[codex] 前次前台会话附属关系读取失败，继续发布过期详情：${error && error.message ? error.message : String(error)}`);
+        return true;
+      });
+      const previousAttached = attachedInState || desktopDirectoryAttachedSince(transition.previousThreadID, attachmentEpoch);
       for (const subscriber of desktopWatchSubscribers.values()) {
         if (subscriber.pluginWide || subscriber.threadID === transition.previousThreadID) {
-          emitDesktopWatchStale(subscriber, transition.previousThreadID);
+          emitDesktopWatchStale(subscriber, transition.previousThreadID, previousAttached);
         }
       }
     }
-    await emitDesktopTerminalRunEvents(threadID, status, detailSnapshot, sessionHint, { requireFresh: true });
     if (status === "running" || status === "waiting_approval") {
       const trackedRollout = await resolveRolloutFile(threadID);
       desktopRunFileWatchStart(threadID, trackedRollout);
+    } else {
+      await emitDesktopTerminalRunEvents(threadID, status, detailSnapshot, desktopSessionHint(threadID, snapshot, status), { requireFresh: true });
     }
+    const attachmentEpoch = desktopDirectoryAttachmentEpoch;
+    const attachedInState = await isAttachedSideChat(threadID);
+    const attached = attachedInState || desktopDirectoryAttachedSince(threadID, attachmentEpoch);
+    const sessionHint = attached ? null : desktopSessionHint(threadID, snapshot, status);
     for (const subscriber of desktopWatchSubscribers.values()) {
       if (!subscriber.pluginWide && subscriber.threadID !== threadID) continue;
+      if (subscriber.pluginWide && attached) {
+        subscriber.signature = "";
+        continue;
+      }
       const signature = subscriber.pluginWide ? indexSignature : detailSignature;
-      if (!transition.recovered && !transition.switched && subscriber.signature === signature) continue;
+      if (!transition.recovered && !transition.switched && subscriber.signature === signature
+          && Boolean(subscriber.sessionHint) === Boolean(sessionHint)) continue;
       const messagesChanged = subscriber.messagesSignature !== messagesSignature;
       logDesktopWatchSignatureDrift(subscriber.signature, signature);
       subscriber.signature = signature;
@@ -6860,7 +6963,7 @@ async function pollDesktopWatch() {
     pollFailed = true;
     recordDesktopWatchMetric("polls_failed");
     console.error(`[codex] desktop watcher poll failed: ${error && error.message ? error.message : String(error)}`);
-    reportDesktopWatchFailure();
+    await reportDesktopWatchFailure();
   } finally {
     const costMs = Date.now() - startedAt;
     if (!pollFailed) recordDesktopWatchMetric("polls_completed");
@@ -6918,16 +7021,17 @@ function createDesktopWatchEventQueue(signal, options = {}) {
   return {
     push(event) {
       if (closed) return;
+      const entry = { done: false, value: event, attachmentEpoch: desktopDirectoryAttachmentEpoch };
       const waiter = waiters.shift();
       if (waiter) {
-        waiter({ done: false, value: event });
+        waiter(entry);
         return;
       }
       const coalesceKey = desktopWatchEventCoalesceKey(event);
       if (coalesceKey) {
-        const existingIndex = pending.findIndex((candidate) => desktopWatchEventCoalesceKey(candidate) === coalesceKey);
+        const existingIndex = pending.findIndex((candidate) => desktopWatchEventCoalesceKey(candidate.value) === coalesceKey);
         if (existingIndex >= 0) {
-          pending[existingIndex] = event;
+          pending[existingIndex] = entry;
           recordDesktopWatchMetric("queue_events_coalesced");
           return;
         }
@@ -6942,16 +7046,27 @@ function createDesktopWatchEventQueue(signal, options = {}) {
         logDesktopWatchTelemetry(true);
         return;
       }
-      pending.push(event);
+      pending.push(entry);
       observeDesktopWatchQueueDepth(pending.length);
     },
     next() {
-      if (pending.length > 0) return Promise.resolve({ done: false, value: pending.shift() });
+      if (pending.length > 0) return Promise.resolve(pending.shift());
       if (closed) return Promise.resolve({ done: true, value: undefined });
       return new Promise((resolve) => waiters.push(resolve));
     },
     close,
   };
+}
+
+function desktopWatchEventForSubscription({ value: event, attachmentEpoch }, pluginWide = false) {
+  const payload = event?.Payload;
+  if (event?.Type === "watcher.foreground.unavailable") {
+    // 状态通知保留原生路由；后续附属关系变化只影响目录提示。
+    return { ...event, Payload: { ...payload, session_hint: undefined } };
+  }
+  if (!desktopDirectoryAttachedSince(payload?.native_session?.native_thread_id, attachmentEpoch)) return event;
+  if (pluginWide) return null;
+  return payload.session_hint ? { ...event, Payload: { ...payload, session_hint: undefined } } : event;
 }
 
 async function* subscribe(session, signal) {
@@ -6976,7 +7091,7 @@ async function* subscribe(session, signal) {
     while (true) {
       const next = await queue.next();
       if (next.done) return;
-      yield next.value;
+      yield desktopWatchEventForSubscription(next);
     }
   } finally {
     queue.close();
@@ -7009,7 +7124,8 @@ async function* subscribePlugin(signal) {
     while (true) {
       const next = await queue.next();
       if (next.done) return;
-      yield next.value;
+      const event = desktopWatchEventForSubscription(next, true);
+      if (event) yield event;
     }
   } finally {
     queue.close();
@@ -7027,6 +7143,7 @@ async function interrupt(session) {
     throw new Error("control_target_stale: interrupt requires a resolved Codex thread id");
   }
   return runExclusiveDesktopControl(async () => {
+    await assertRemoteThreadControlAllowed(threadID);
     const controller = await codexDesktopController();
     await selectRequiredCodexThread(controller, threadID);
     await controller.interrupt();
