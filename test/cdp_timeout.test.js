@@ -229,11 +229,11 @@ test("composer primary action is uniquely scoped to its footer and uses a real C
 
   assert.match(availabilityScript, /data-composer-navigation-target/);
   assert.match(availabilityScript, /aria-haspopup/);
-  assert.match(availabilityScript, /hasComposerPrimaryButtonContract/);
+  assert.match(availabilityScript, /isPrimaryButton/);
   assert.match(clickScript, /data-codex-composer/);
-  assert.match(clickScript, /actionCandidates\.length === 1/);
-  assert.match(clickScript, /hasComposerPrimaryButtonContract/);
-  assert.doesNotMatch(clickScript, /发送|Send|size-token-button-composer|dispatchEvent/);
+  assert.match(clickScript, /actionCandidates\.length !== 1/);
+  assert.match(clickScript, /isPrimaryButton/);
+  assert.doesNotMatch(clickScript.replace(/^\s*\/\/.*$/gm, ""), /发送|Send|size-token-button-composer|dispatchEvent/);
 });
 
 test("composer send waits for the Fiber submit mode instead of any footer button", async () => {
@@ -378,8 +378,8 @@ test("running queue Composer clicks its unique primary action without a localize
   };
   controller.clickElement = async (source) => {
     clicked = true;
-    assert.match(source, /actionCandidates\.length === 1/);
-    assert.doesNotMatch(source, /加入队列|排队/);
+    assert.match(source, /actionCandidates\.length !== 1/);
+    assert.doesNotMatch(source.replace(/^\s*\/\/.*$/gm, ""), /加入队列|排队/);
   };
 
   const result = await controller.clickComposerPrimaryButton("queue");

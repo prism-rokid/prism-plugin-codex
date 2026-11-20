@@ -20,7 +20,7 @@ const {
 } = requireCdpRuntime();
 
 const execFileAsync = promisify(execFile);
-const {questionOwnerSource, validateQuestionAnswers} = require("./question_surface");
+const {PLAN_IMPLEMENT_OPTION, questionOwnerSource, validateQuestionAnswers} = require("./question_surface");
 
 // Codex stores thread cwds with the Windows long-path prefix ("\\\\?\E:\...")
 // while the desktop UI keeps plain project paths. Strip the prefix before any
@@ -297,6 +297,19 @@ function visibleDesktopElementExpression(selector) {
   }) || null)()`;
 }
 
+// Both selectors describe the same combined model/reasoning owner across
+// Desktop versions. Refuse ambiguous visible owners rather than picking one.
+function intelligenceTriggerElementExpression() {
+  const selector = '[data-codex-intelligence-trigger="true"], [data-composer-navigation-target="reasoning"][data-selected-reasoning-effort]';
+  return `(() => {
+    const candidates = [...document.querySelectorAll(${JSON.stringify(selector)})].filter((element) => {
+      const rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    });
+    return candidates.length === 1 ? candidates[0] : null;
+  })()`;
+}
+
 function composerEditableElementExpression() {
   return `(() => {
     const visible = (element) => {
@@ -342,82 +355,12 @@ function composerContainerElementExpression() {
   })()`;
 }
 
-function composerPrimaryActionElementExpression() {
+function composerPrimaryActionElementExpression(expectedSubmissionKind) {
   return `(() => {
-    const visible = (element) => {
-      const rect = element && element.getBoundingClientRect();
-      return Boolean(rect && rect.width > 0 && rect.height > 0);
-    };
-    const enabled = (element) => Boolean(
-      element
-      && !element.disabled
-      && element.getAttribute('aria-disabled') !== 'true',
-    );
-    const composer = ${composerContainerElementExpression()};
-    if (!composer) return null;
-    // Onboarding and approval forms can use a composer-shaped container and
-    // inherit Composer Fiber state. They are not a chat input without an
-    // editable surface, so never expose their submit button to remote control.
-    const editableSurfaces = [
-      ...(composer.matches('textarea, input:not([type="hidden"]), [contenteditable="true"]') ? [composer] : []),
-      ...composer.querySelectorAll('textarea, input:not([type="hidden"]), [contenteditable="true"]'),
-    ].filter(visible).filter((element) => enabled(element) && !element.readOnly);
-    if (editableSurfaces.length === 0) return null;
-    const fiberFor = (element) => {
-      const key = element && Object.keys(element).find((name) => name.startsWith('__reactFiber$'));
-      return key ? element[key] : null;
-    };
-    const hasComposerPrimaryButtonContract = (element) => {
-      for (let current = fiberFor(element), depth = 0; current && depth < 64; current = current.return, depth += 1) {
-        const props = current.memoizedProps;
-        if (
-          props && typeof props === 'object'
-          && typeof props.isLoading === 'boolean'
-          && typeof props.disabled === 'boolean'
-          && typeof props.ariaLabel === 'string'
-          && props.Icon
-          && typeof props.onClick === 'function'
-        ) return true;
-      }
-      return false;
-    };
-    const isComposerPrimaryAction = (element) => {
-      if (!hasComposerPrimaryButtonContract(element)) return false;
-      let legacyOwnerCount = 0;
-      let modernOwnerCount = 0;
-      for (let current = fiberFor(element), depth = 0; current && depth < 64; current = current.return, depth += 1) {
-        const props = current.memoizedProps;
-        if (!props || typeof props !== 'object') continue;
-        if (
-          typeof props.submitButtonMode === 'string'
-          && typeof props.isResponseInProgress === 'boolean'
-          && typeof props.isQueueingEnabled === 'boolean'
-          && typeof props.submitDisabled === 'boolean'
-        ) legacyOwnerCount += 1;
-        const turn = props.turn;
-        if (
-          turn && typeof turn === 'object'
-          && typeof turn.serverInProgress === 'boolean'
-          && typeof turn.hasMessageContent === 'boolean'
-          && typeof turn.transitionBlocksSubmit === 'boolean'
-          && typeof props.submitDisabled === 'boolean'
-        ) modernOwnerCount += 1;
-      }
-      // Codex Desktop 26.1103 将 Composer 状态从旧的 mode/queue 属性移到了 turn 对象，必须匹配唯一完整契约。
-      return (legacyOwnerCount === 1 && modernOwnerCount === 0)
-        || (legacyOwnerCount === 0 && modernOwnerCount === 1);
-    };
-    for (let footer = composer; footer; footer = footer.parentElement) {
-      if (footer.querySelectorAll('[data-composer-navigation-target]').length === 0) continue;
-      const candidates = [...footer.querySelectorAll('button, [role="button"]')]
-        .filter(visible)
-        .filter(enabled)
-        .filter((element) => !element.hasAttribute('data-composer-navigation-target'))
-        .filter((element) => String(element.getAttribute('aria-haspopup') || '').toLowerCase() !== 'menu');
-      const actionCandidates = candidates.filter(isComposerPrimaryAction);
-      return actionCandidates.length === 1 ? actionCandidates[0] : null;
-    }
-    return null;
+    ${composerPrimaryActionFactsSource()}
+    const facts = prismComposerPrimaryActionFacts();
+    const submissionKind = (${composerSubmissionKind.toString()})(facts);
+    return submissionKind === ${JSON.stringify(expectedSubmissionKind)} ? facts.element : null;
   })()`;
 }
 
@@ -473,9 +416,8 @@ function composerAttachmentStateSource() {
   `;
 }
 
-// Codex exposes the composer action's state on the nearest composer Fiber.
-// Keep the Desktop semantic contract separate from localized visible labels:
-// a missing or ambiguous owner is unavailable, never guessed.
+// 两代 Codex 都通过原生主按钮提交。由同一个解析器确认按钮及其状态，
+// 候选不唯一或结构未知时停下，避免把听写、语音或停止按钮当成发送。
 function composerPrimaryActionFactsSource() {
   return `
     const prismComposerPrimaryActionFacts = () => {
@@ -484,46 +426,165 @@ function composerPrimaryActionFactsSource() {
         return Boolean(rect && rect.width > 0 && rect.height > 0);
       };
       const enabled = (element) => Boolean(
-        element
-        && !element.disabled
-        && element.getAttribute('aria-disabled') !== 'true',
+        element && !element.disabled && element.getAttribute('aria-disabled') !== 'true'
       );
-      const fiberFor = (element) => {
-        const key = element && Object.keys(element).find((name) => name.startsWith('__reactFiber$'));
-        return key ? element[key] : null;
+      // DOM 可以指向任一 alternate；bailout 复用 child 时，return 链并不代表已提交分支。
+      // 复用问答控件的共享子树判定，每一级祖先也必须解析当前 Fiber。
+      const composerOwn = (value, key) => {
+        try { return Object.getOwnPropertyDescriptor(value, key)?.value; } catch { return undefined; }
       };
-      const hasComposerPrimaryButtonContract = (element) => {
-        for (let current = fiberFor(element), depth = 0; current && depth < 64; current = current.return, depth += 1) {
-          const props = current.memoizedProps;
-          if (
-            props && typeof props === 'object'
-            && typeof props.isLoading === 'boolean'
-            && typeof props.disabled === 'boolean'
-            && typeof props.ariaLabel === 'string'
-            && props.Icon
-            && typeof props.onClick === 'function'
-          ) return true;
+    const resolveComposerFiber = fiber => {
+      if (!fiber) return null;
+      const alternate = composerOwn(fiber, 'alternate');
+      if (!alternate) return fiber;
+      let a = fiber, b = alternate;
+      for (let depth = 0; depth < 256; depth++) {
+        const parentA = composerOwn(a, 'return');
+        if (!parentA) {
+          const current = composerOwn(composerOwn(a, 'stateNode'), 'current');
+          return current === a ? fiber : current === b ? alternate : null;
         }
-        return false;
+        const parentB = composerOwn(parentA, 'alternate');
+        if (!parentB) {
+          const next = composerOwn(parentA, 'return');
+          if (!next) return null;
+          a = b = next;
+          continue;
+        }
+        const childA = composerOwn(parentA, 'child'), childB = composerOwn(parentB, 'child');
+        if (childA === childB) {
+          let child = childA;
+          for (let n = 0; child && n < 50000; n++, child = composerOwn(child, 'sibling')) {
+            if (child === a) return fiber;
+            if (child === b) return alternate;
+          }
+          return null;
+        }
+        if (composerOwn(a, 'return') !== composerOwn(b, 'return')) {
+          a = parentA; b = parentB;
+        } else {
+          let found = false;
+          for (const parent of [parentA, parentB]) {
+            let child = composerOwn(parent, 'child');
+            for (let n = 0; child && n < 50000; n++, child = composerOwn(child, 'sibling')) {
+              if (child === a) { a = parent; b = parent === parentA ? parentB : parentA; found = true; break; }
+              if (child === b) { b = parent; a = parent === parentA ? parentB : parentA; found = true; break; }
+            }
+            if (found) break;
+          }
+          if (!found) return null;
+        }
+        if (composerOwn(a, 'alternate') !== b) return null;
+      }
+      return null;
+    };
+      const composerFiberCache = new Map();
+      const currentFiber = (fiber) => {
+        if (!fiber) return null;
+        if (!composerFiberCache.has(fiber)) composerFiberCache.set(fiber, resolveComposerFiber(fiber));
+        return composerFiberCache.get(fiber);
       };
-      const textOf = (element) => String(element && (element.innerText || element.textContent) || '').replace(/\s+/g, ' ').trim();
+      const committedFiber = (element) => {
+        const key = Object.keys(element).find((name) => name.startsWith('__reactFiber$'));
+        return currentFiber(key ? composerOwn(element, key) : null);
+      };
+      const isPrimaryButton = (props) => props
+        && typeof props.isLoading === 'boolean'
+        && typeof props.disabled === 'boolean'
+        && typeof props.ariaLabel === 'string'
+        && props.Icon
+        && typeof props.onClick === 'function';
+      const modernAction = (button, view, owner) => {
+        const turn = owner?.turn;
+        if (!view || !turn || typeof turn.serverInProgress !== 'boolean'
+          || typeof turn.hasMessageContent !== 'boolean'
+          || typeof turn.isAeon !== 'boolean'
+          || typeof owner.submitDisabled !== 'boolean'
+          || (owner.followUpAction !== 'queue' && owner.followUpAction !== 'steer')) return null;
+        // 新版的发送、排队和引导共用按钮组件。停止沿用原生回调身份；
+        // 恢复、语音和听写也用相似按钮，但没有文本提交专用的属性。
+        const stop = button.onClick === owner.onStop;
+        const submit = Object.prototype.hasOwnProperty.call(button, 'blockedReasonOpenNonce');
+        if (stop && submit) return null;
+        return {
+          mode: stop ? 'stop' : submit ? 'submit' : 'other',
+          response_in_progress: stop || turn.serverInProgress,
+          queueing_enabled: !turn.isAeon && owner.followUpAction === 'queue',
+          submit_disabled: owner.submitDisabled || button.isLoading,
+          stopping: owner.isStopping === true,
+          resume_pending: owner.isResumePending === true,
+          interaction_blocked: view.isInteractionBlocked === true || owner.interactionsEnabled !== true,
+          has_message_content: turn.hasMessageContent,
+          submission_kind: !submit ? '' : turn.serverInProgress && !turn.isAeon
+            ? (owner.followUpAction === 'queue' ? 'queue' : 'guide') : 'send',
+        };
+      };
+      const actionState = (element) => {
+        let button;
+        let view;
+        let owner;
+        const legacyOwners = [];
+        const turnOwners = [];
+        let queueingEnabled = false;
+        let interactionBlocked = false;
+        let stopping = false;
+        let resumePending = false;
+        for (let current = committedFiber(element), depth = 0; current && depth < 64; current = currentFiber(composerOwn(current, 'return')), depth += 1) {
+          const props = current.memoizedProps;
+          if (!props || typeof props !== 'object') continue;
+          if (props.turn && typeof props.turn.serverInProgress === 'boolean'
+            && typeof props.turn.hasMessageContent === 'boolean'
+            && typeof props.turn.transitionBlocksSubmit === 'boolean'
+            && typeof props.submitDisabled === 'boolean') turnOwners.push(props);
+          if (props.queuedFollowUpSubmission && typeof props.queuedFollowUpSubmission === 'object') queueingEnabled = true;
+          if (props.isInteractionBlocked === true) interactionBlocked = true;
+          if (props.isStopping === true) stopping = true;
+          if (props.isResumePending === true) resumePending = true;
+          if (!button && isPrimaryButton(props)) button = props;
+          if (button && props.primaryAction?.props === button) view = props;
+          if (view && !owner && typeof props.handleSubmit === 'function') owner = props;
+          if (typeof props.submitButtonMode === 'string'
+            && typeof props.isResponseInProgress === 'boolean'
+            && typeof props.isQueueingEnabled === 'boolean'
+            && typeof props.submitDisabled === 'boolean') legacyOwners.push(props);
+        }
+        if (!button) return null;
+        if (view) return modernAction(button, view, owner);
+        if (legacyOwners.length === 0 && turnOwners.length === 1) {
+          const owner = turnOwners[0];
+          return {
+            mode: owner.turn.serverInProgress ? 'stop' : 'submit',
+            response_in_progress: owner.turn.serverInProgress,
+            queueing_enabled: queueingEnabled,
+            submit_disabled: owner.submitDisabled || owner.turn.transitionBlocksSubmit,
+            stopping, resume_pending: resumePending, interaction_blocked: interactionBlocked,
+            has_message_content: owner.turn.hasMessageContent,
+          };
+        }
+        if (legacyOwners.length !== 1 || turnOwners.length !== 0) return null;
+        const legacy = legacyOwners[0];
+        return {
+          mode: legacy.submitButtonMode.trim().toLowerCase(),
+          response_in_progress: legacy.isResponseInProgress,
+          queueing_enabled: legacy.isQueueingEnabled,
+          submit_disabled: legacy.submitDisabled,
+          stopping: legacy.isStopping === true,
+          resume_pending: legacy.isResumePending === true,
+          interaction_blocked: legacy.isInteractionBlocked === true,
+          has_message_content: legacy.hasMessageContent === true,
+        };
+      };
       const composer = ${composerContainerElementExpression()};
       if (!composer) return { usable: false, reason: 'composer_unavailable' };
-      // A Composer-shaped root can temporarily contain an internal onboarding
-      // form. Its inherited Fiber props must not project it as a running chat.
       const editableSurfaces = [
         ...(composer.matches('textarea, input:not([type="hidden"]), [contenteditable="true"]') ? [composer] : []),
         ...composer.querySelectorAll('textarea, input:not([type="hidden"]), [contenteditable="true"]'),
       ].filter(visible).filter((element) => enabled(element) && !element.readOnly);
       if (editableSurfaces.length === 0) return { usable: false, reason: 'composer_input_unavailable' };
-      // In current Codex builds the owner still exposes the submit/stop state,
-      // but its hasMessageContent property can stay false after a native CDP
-      // input. The visible editable surface and attachment row are the native payload
-      // surface that the same submit button operates on, so use them only for
-      // payload presence while retaining Fiber facts for action semantics.
       ${composerAttachmentStateSource()}
-      const attachmentState = prismComposerAttachmentState();
-      const hasNativePayload = editableSurfaces.some((element) => Boolean(textOf(element))) || attachmentState.present === true;
+      const hasNativePayload = editableSurfaces.some((element) => Boolean(
+        String(element.value ?? element.innerText ?? element.textContent ?? '').trim()
+      )) || prismComposerAttachmentState().present === true;
       let footer = null;
       for (let node = composer; node; node = node.parentElement) {
         if ([...node.querySelectorAll('[data-composer-navigation-target]')].some(visible)) {
@@ -536,83 +597,41 @@ function composerPrimaryActionFactsSource() {
         .filter(visible)
         .filter((element) => !element.hasAttribute('data-composer-navigation-target'))
         .filter((element) => String(element.getAttribute('aria-haspopup') || '').toLowerCase() !== 'menu');
-      // Desktop layouts can put the submit state owner beyond 16 Fiber ancestors.
-      // Use a bounded 64-level search and keep the exact owner/primary-button
-      // contracts and unique candidate checks, including when dictation is present.
-      // Other composer actions (for example dictation) can be siblings of the
-      // actual submit button. Select only the button whose Fiber ancestry owns
-      // the complete submit state and the primary-button contract; visible
-      // labels, button order, and CSS classes are not a stable contract.
       const actionCandidates = [];
       for (const element of candidates) {
-        if (!hasComposerPrimaryButtonContract(element)) continue;
-        const owners = [];
-        let modernState = null;
-        let modernOwnerCount = 0;
-        let queueingEnabled = false;
-        let interactionBlocked = false;
-        let stopping = false;
-        let resumePending = false;
-        for (let current = fiberFor(element), depth = 0; current && depth < 64; current = current.return, depth += 1) {
-          const props = current.memoizedProps;
-          if (!props || typeof props !== 'object') continue;
-          if (
-            typeof props.submitButtonMode === 'string'
-            && typeof props.isResponseInProgress === 'boolean'
-            && typeof props.isQueueingEnabled === 'boolean'
-            && typeof props.submitDisabled === 'boolean'
-          ) {
-            owners.push(props);
-          }
-          const turn = props.turn;
-          if (
-            turn && typeof turn === 'object'
-            && typeof turn.serverInProgress === 'boolean'
-            && typeof turn.hasMessageContent === 'boolean'
-            && typeof turn.transitionBlocksSubmit === 'boolean'
-            && typeof props.submitDisabled === 'boolean'
-          ) {
-            modernOwnerCount += 1;
-            modernState = { turn, submitDisabled: props.submitDisabled };
-          }
-          if (props.queuedFollowUpSubmission && typeof props.queuedFollowUpSubmission === 'object') queueingEnabled = true;
-          if (props.isInteractionBlocked === true) interactionBlocked = true;
-          if (props.isStopping === true) stopping = true;
-          if (props.isResumePending === true) resumePending = true;
-        }
-        if (owners.length === 1 && modernOwnerCount === 0) {
-          actionCandidates.push({ element, owner: owners[0], kind: 'legacy', queueingEnabled: owners[0].isQueueingEnabled === true, interactionBlocked: owners[0].isInteractionBlocked === true, stopping: owners[0].isStopping === true, resumePending: owners[0].isResumePending === true });
-        } else if (owners.length === 0 && modernOwnerCount === 1 && modernState) {
-          actionCandidates.push({ element, owner: modernState, kind: 'modern', queueingEnabled, interactionBlocked, stopping, resumePending });
-        }
+        const state = actionState(element);
+        if (state) actionCandidates.push({ element, state });
       }
       if (actionCandidates.length !== 1) return { usable: false, reason: 'composer_action_owner_ambiguous' };
-      const { element, owner, kind } = actionCandidates[0];
-      const modern = kind === 'modern';
-      const mode = modern
-        ? (owner.turn.serverInProgress === true ? 'stop' : 'submit')
-        : String(owner.submitButtonMode || '').trim().toLowerCase();
+      const { element, state } = actionCandidates[0];
       return {
-        usable: Boolean(mode),
+        ...state,
+        element,
+        usable: Boolean(state.mode),
         enabled: enabled(element),
-        mode,
-        response_in_progress: modern ? owner.turn.serverInProgress === true : owner.isResponseInProgress === true,
-        queueing_enabled: modern ? actionCandidates[0].queueingEnabled : owner.isQueueingEnabled === true,
-        submit_disabled: modern ? owner.submitDisabled === true || owner.turn.transitionBlocksSubmit === true : owner.submitDisabled === true,
-        stopping: modern ? actionCandidates[0].stopping : owner.isStopping === true,
-        resume_pending: modern ? actionCandidates[0].resumePending : owner.isResumePending === true,
-        interaction_blocked: modern ? actionCandidates[0].interactionBlocked : owner.isInteractionBlocked === true,
-        has_message_content: modern ? owner.turn.hasMessageContent === true || hasNativePayload : owner.hasMessageContent === true || hasNativePayload,
+        has_message_content: state.has_message_content || hasNativePayload,
       };
     };
   `;
 }
 
+function composerSubmissionKind(facts) {
+  if (facts?.usable !== true || facts.enabled !== true || facts.submit_disabled === true
+    || facts.interaction_blocked === true || facts.has_message_content !== true) return "";
+  if (facts.mode === "submit") return facts.submission_kind || "send";
+  // 旧版在排队或引导时仍暴露 Stop 模式。新版的 Stop 是实际停止按钮。
+  if (facts.submission_kind === undefined && facts.mode === "stop"
+    && facts.response_in_progress === true && typeof facts.queueing_enabled === "boolean") {
+    return facts.queueing_enabled ? "queue" : "guide";
+  }
+  return "";
+}
+
 function composerPrimaryActionRuntimeExpression() {
   return `(() => {
     ${composerPrimaryActionFactsSource()}
-    const facts = prismComposerPrimaryActionFacts();
-    return facts && typeof facts === 'object' ? facts : { usable: false, reason: 'composer_action_unavailable' };
+    const { element, ...facts } = prismComposerPrimaryActionFacts();
+    return facts;
   })()`;
 }
 
@@ -620,13 +639,8 @@ function composerStopElementExpression() {
   return `(() => {
     ${composerPrimaryActionFactsSource()}
     const facts = prismComposerPrimaryActionFacts();
-    if (!facts || facts.usable !== true || facts.enabled !== true || facts.response_in_progress !== true || facts.mode !== 'stop') {
-      return null;
-    }
-    // Dictation and other utility buttons share this footer. Resolve the
-    // primary action by its native Composer contract, just as send does.
-    const action = ${composerPrimaryActionElementExpression()};
-    return action || null;
+    return facts.usable && facts.enabled && facts.response_in_progress && facts.mode === 'stop'
+      ? facts.element : null;
   })()`;
 }
 
@@ -1187,7 +1201,7 @@ function intelligenceRootControlsExpression() {
       const rect = el && el.getBoundingClientRect();
       return Boolean(rect && rect.width > 0 && rect.height > 0);
     };
-    const trigger = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
+    const trigger = ${intelligenceTriggerElementExpression()};
     if (!trigger) return [];
     const rootRows = (menu) => [...menu.querySelectorAll('[role]')]
       .filter((el) => el.closest('[role="menu"]') === menu)
@@ -1220,7 +1234,7 @@ const FLAT_INTELLIGENCE_MODEL_CONTROL_ID = "codex.intelligence.flat-model";
 // menu, instead of exposing model/reasoning submenu roots with aria-controls.
 function flatIntelligenceMenuRowsExpression() {
   return `(() => {
-    const trigger = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
+    const trigger = ${intelligenceTriggerElementExpression()};
     if (!trigger) return [];
     const visible = (el) => {
       const rect = el && el.getBoundingClientRect();
@@ -1289,7 +1303,7 @@ function reasoningSliderFactsExpression() {
       .find((text) => /第\\s*\\d+\\s*项/.test(text)) || '';
     const match = announcement.match(/^(.*?)[，,]\\s*第\\s*(\\d+)\\s*项[，,]\\s*共\\s*(\\d+)\\s*项/) || null;
     const prefixParts = match ? match[1].trim().split(/\\s+/).filter(Boolean) : [];
-    const trigger = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
+    const trigger = ${intelligenceTriggerElementExpression()};
     let selections = [];
     let selectedIndex = -1;
     let hasNativeSelection = false;
@@ -1382,7 +1396,7 @@ function intelligenceSubmenuRowsExpression(controlID) {
         '[data-state="checked"], [data-state="selected"], [data-checked="true"], [data-selected="true"]'
       ));
     };
-    const trigger = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
+    const trigger = ${intelligenceTriggerElementExpression()};
     if (!trigger) return [];
     const rootRows = (menu) => [...menu.querySelectorAll('[role]')]
       .filter((el) => el.closest('[role="menu"]') === menu)
@@ -1493,7 +1507,7 @@ function closedComposerControlsExpression() {
       return parts.length > 1 ? parts[parts.length - 1] : '';
     };
     const permission = ${visibleDesktopElementExpression('[data-composer-navigation-target="permissions"]')};
-    const intelligence = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
+    const intelligence = ${intelligenceTriggerElementExpression()};
     return {
       permission: permission && visible(permission) ? {
         controlId: 'codex.permission', currentValue: valueOf(permission),
@@ -1681,12 +1695,13 @@ function macProfileDir() {
   return path.join(os.homedir(), "Library", "Application Support", "Codex");
 }
 
-function windowsProfileDir(env = process.env, exists = fs.existsSync) {
+function windowsProfileDir(env = process.env, exists = fs.existsSync, appPath = "") {
   const appData = firstNonEmpty(env.APPDATA, env.LOCALAPPDATA);
   const root = appData ? path.join(appData, "Codex") : path.join(os.homedir(), "AppData", "Roaming", "Codex");
-  // The Microsoft Store build keeps its Chromium profile below web/Codex.
-  // Prefer it when present so the Plugin observes the same DevTools port as
-  // the Hub-managed Store executable; classic installs retain the old root.
+  // Bind the profile to the selected installation, not stale folders left by
+  // another installation. Hub normally supplies both paths explicitly.
+  const selected = appPath || env.PRISM_CODEX_APP_PATH || (process.platform === "win32" ? defaultAppPath() : "");
+  if (selected) return /[\\/]WindowsApps[\\/]/i.test(selected) ? path.join(root, "web", "Codex") : root;
   const storeProfile = path.join(root, "web", "Codex");
   return exists(storeProfile) ? storeProfile : root;
 }
@@ -1729,7 +1744,7 @@ function defaultAppPath() {
 }
 
 function codexAppPath() {
-  return firstNonEmpty(process.env.PRISM_CODEX_APP_PATH, defaultAppPath());
+  return String(process.env.PRISM_CODEX_APP_PATH || "").trim() || defaultAppPath();
 }
 
 function macAppBundlePath(appPath = "") {
@@ -2378,45 +2393,8 @@ class CodexDesktopController extends CdpPageClient {
     while (Date.now() < deadline) {
       const facts = await this.evaluate(composerPrimaryActionRuntimeExpression());
       lastFacts = facts && typeof facts === "object" ? facts : null;
-      const standardSubmit = lastFacts
-        && lastFacts.usable === true
-        && lastFacts.enabled === true
-        && lastFacts.submit_disabled !== true
-        && lastFacts.interaction_blocked !== true
-        && lastFacts.mode === "submit"
-        && lastFacts.has_message_content === true;
-      // A running Codex conversation whose Desktop preference is Queue keeps
-      // its Fiber mode as `stop`, even after text is written. The single
-      // primary DOM action nevertheless becomes the native queue submit. The
-      // tuple below is the complete semantic guard; never infer it from the
-      // localized aria-label or visible button text.
-      const nativeQueueSubmit = lastFacts
-        && lastFacts.usable === true
-        && lastFacts.enabled === true
-        && lastFacts.submit_disabled !== true
-        && lastFacts.interaction_blocked !== true
-        && lastFacts.mode === "stop"
-        && lastFacts.response_in_progress === true
-        && lastFacts.queueing_enabled === true
-        && lastFacts.has_message_content === true;
-      // In Guide mode Codex keeps the current turn's Fiber mode as Stop, but
-      // the same primary node becomes the native guide submit once it holds
-      // text. It is distinct from Queue only by the explicit Fiber flag.
-      const nativeGuideSubmit = lastFacts
-        && lastFacts.usable === true
-        && lastFacts.enabled === true
-        && lastFacts.submit_disabled !== true
-        && lastFacts.interaction_blocked !== true
-        && lastFacts.mode === "stop"
-        && lastFacts.response_in_progress === true
-        && lastFacts.queueing_enabled === false
-        && lastFacts.has_message_content === true;
-      if (standardSubmit || nativeQueueSubmit || nativeGuideSubmit) {
-        return {
-          ...lastFacts,
-          submission_kind: nativeQueueSubmit ? "queue" : (nativeGuideSubmit ? "guide" : "send"),
-        };
-      }
+      const submissionKind = composerSubmissionKind(lastFacts);
+      if (submissionKind) return { ...lastFacts, submission_kind: submissionKind };
       await sleep(100);
     }
     // Do not include composer content in the failure. These facts make a
@@ -2439,22 +2417,14 @@ class CodexDesktopController extends CdpPageClient {
     if (!facts || facts.usable !== true || facts.enabled !== true || facts.submit_disabled === true) {
       throw new Error("control_target_stale");
     }
-    const standardSubmit = facts.mode === "submit" && facts.has_message_content === true
-      && facts.interaction_blocked !== true;
-    const nativeQueueSubmit = facts.mode === "stop" && facts.response_in_progress === true
-      && facts.queueing_enabled === true && facts.has_message_content === true
-      && facts.interaction_blocked !== true;
-    const nativeGuideSubmit = facts.mode === "stop" && facts.response_in_progress === true
-      && facts.queueing_enabled === false && facts.has_message_content === true
-      && facts.interaction_blocked !== true;
-    if (!standardSubmit && !nativeQueueSubmit && !nativeGuideSubmit) {
+    const submissionKind = composerSubmissionKind(facts);
+    if (!submissionKind) {
       throw new Error("queue_unavailable");
     }
-    const submissionKind = nativeQueueSubmit ? "queue" : (nativeGuideSubmit ? "guide" : "send");
     if (expectedSubmissionKind && expectedSubmissionKind !== submissionKind) {
       throw new Error("control_target_stale");
     }
-    const action = composerPrimaryActionElementExpression();
+    const action = composerPrimaryActionElementExpression(submissionKind);
     const available = await this.evaluate(`Boolean(${action})`);
     if (!available) {
       throw new Error("control_target_stale");
@@ -3462,14 +3432,14 @@ class CodexDesktopController extends CdpPageClient {
 
   async openIntelligenceMenu() {
     await this.ensureReady();
-    const script = `(() => ${visibleDesktopElementExpression('[data-codex-intelligence-trigger=\"true\"]')})()`;
+    const script = `(() => ${intelligenceTriggerElementExpression()})()`;
     let lastError = null;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       await this.closeVisibleMenus();
       await this.clickElement(script);
       try {
         await this.waitFor(`(() => {
-          const trigger = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
+          const trigger = ${intelligenceTriggerElementExpression()};
           if (!trigger || trigger.getAttribute('aria-expanded') !== 'true') return false;
           const visible = (el) => {
             const rect = el && el.getBoundingClientRect();
@@ -3877,7 +3847,7 @@ class CodexDesktopController extends CdpPageClient {
         el.getAttribute('aria-haspopup') === 'menu' && el.hasAttribute('aria-controls');
       const isMenuRow = (el) => ['menuitem', 'menuitemradio', 'menuitemcheckbox', 'option']
         .includes(String(el && el.getAttribute('role') || '').toLowerCase());
-      const trigger = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
+      const trigger = ${intelligenceTriggerElementExpression()};
       if (!trigger) return null;
       const menus = [...document.querySelectorAll('[role="menu"]')].filter((menu) =>
         visible(menu) && [...menu.querySelectorAll('[role]')].some((el) => isRootRow(el, menu))
@@ -3950,7 +3920,7 @@ class CodexDesktopController extends CdpPageClient {
           throw new Error("control_target_stale: flat intelligence option is not uniquely present in the current desktop menu");
         }
         const target = `(() => {
-          const trigger = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
+          const trigger = ${intelligenceTriggerElementExpression()};
           if (!trigger) return null;
           const visible = (el) => {
             const rect = el && el.getBoundingClientRect();
@@ -4002,27 +3972,39 @@ class CodexDesktopController extends CdpPageClient {
   }
 
   async readInteractiveSurface() {
-    const question = await this.readQuestionSurface();
+    const question = await this.readQuestionSurface(true);
     if (question) {
-      const {_identity, _conversationId, ...surface} = question;
+      const {_identity, _conversationId, _requestId, ...surface} = question;
       return surface;
     }
     const raw = await this.readInteractiveSurfaceRaw();
     return raw ? this.publicInteractiveSurface(raw) : null;
   }
 
-  async readQuestionSurface() {
+  async readQuestionSurface(includePlan = false) {
     const raw = await this.evaluate(`(() => {
-      ${questionOwnerSource(foregroundThreadIdExpression())}
+      ${questionOwnerSource(foregroundThreadIdExpression(), includePlan)}
       const foreground = ${foregroundThreadIdExpression()};
       return questionOwner && questionThreadId(questionOwner.conversationId) === foreground
         ? {identity: questionIdentity(questionOwner), conversation_id: foreground, questions: questionOwner.rows, submitting: questionOwner.panel?.isSubmitting === true, diagnostics: questionDiagnostics}
-        : {diagnostics: questionDiagnostics};
+        : {plan: planFacts(planOwner), conversation_id: foreground, diagnostics: questionDiagnostics};
     })()`);
     const diagnosticSignature = JSON.stringify(raw && raw.diagnostics || {reason:'unavailable'});
     if (diagnosticSignature !== this._questionDiagnosticSignature) {
       this._questionDiagnosticSignature = diagnosticSignature;
       console.error('[codex] question.read ' + diagnosticSignature);
+    }
+    if (includePlan && raw?.plan) {
+      const { identity, requestId, markdown, canImplement, submitting } = raw.plan;
+      const id = 'desktop-plan:' + crypto.createHash('sha256').update(identity).digest('hex');
+      return {
+        surface_id: id, capability: 'plan_review', kind: 'plan_review', description: markdown,
+        actions: [
+          { action_id: id + ':implement', label: '实施此计划', available: canImplement && !submitting },
+          { action_id: id + ':revise', label: '提出修改', available: !submitting, accepts_input: true, requires_input: true }
+        ],
+        _identity: identity, _conversationId: raw.conversation_id, _requestId: requestId
+      };
     }
     if (!raw || typeof raw.identity !== "string" || !Array.isArray(raw.questions) || !raw.questions.length) return null;
     const id = 'desktop-question:' + crypto.createHash('sha256').update(raw.identity).digest('hex');
@@ -4072,7 +4054,50 @@ class CodexDesktopController extends CdpPageClient {
     await this.waitFor(`(() => { ${questionOwnerSource(foregroundThreadIdExpression())} return ${foregroundThreadIdExpression()} === ${JSON.stringify(current._conversationId)} && (!questionOwner || questionIdentity(questionOwner) !== ${JSON.stringify(current._identity)}); })()`, 10000, 100);
   }
 
+  async applyPlanReview(surfaceID, actionID, input) {
+    const current = await this.readQuestionSurface(true);
+    const action = current?.surface_id === surfaceID && current.actions.find(item => item.action_id === actionID && item.available);
+    if (!action) throw new Error('control_target_stale: plan review is no longer available');
+    const implement = actionID === surfaceID + ':implement';
+    const feedback = typeof input === 'string' ? input.trim() : '';
+    if (implement ? Boolean(input) : !feedback || feedback.length > 8192) {
+      throw new Error('control_target_stale: invalid plan review response');
+    }
+    const draft = implement ? { selectedOptionId: PLAN_IMPLEMENT_OPTION } : { freeformText: feedback };
+    const source = questionOwnerSource(foregroundThreadIdExpression(), true);
+    const outcome = await this.evaluate(`(async () => {
+      ${source}
+      const current = planFacts(planOwner);
+      if (questionOwner || current?.identity !== ${JSON.stringify(current._identity)} || current.submitting
+        || (${implement} && !current.canImplement)) return 'stale';
+      const key = Symbol.for('prism.codex.plan-submissions.v1');
+      const seen = window[key] || (window[key] = new Set());
+      if (seen.has(current.identity)) return 'duplicate';
+      const draft = ${JSON.stringify(draft)};
+      if (!${implement}) {
+        // Desktop reserves a feedback response only when the submitted text
+        // matches its own draft. Update that draft with the native comparison
+        // callback and submit in the same evaluation.
+        const props = planOwner.props;
+        const previous = props.freeformEditorRef?.current?.getText?.()
+          ?? props.initialDraft?.answers?.[0]?.freeformText ?? '';
+        props.onFreeformChange(draft.freeformText, previous);
+      }
+      seen.add(current.identity);
+      if (seen.size > 256) seen.delete(seen.values().next().value);
+      await planOwner.submit([draft]);
+      return 'submitted';
+    })()`);
+    if (outcome !== 'submitted') throw new Error('control_target_stale: plan version changed or is already submitted');
+    await this.waitFor(`(() => {
+      ${source}
+      return ${foregroundThreadIdExpression()} === ${JSON.stringify(current._conversationId)}
+        && planOwner?.request.id !== ${JSON.stringify(current._requestId)};
+    })()`, 10000, 100);
+  }
+
   async applyInteractiveSurface(surfaceID, actionID, input = "") {
+    if (String(surfaceID).startsWith('desktop-plan:')) return this.applyPlanReview(surfaceID, actionID, input);
     if (String(surfaceID).startsWith('desktop-question:')) return this.applyQuestionSurface(surfaceID, actionID, input);
     const raw = await this.readInteractiveSurfaceRaw();
     const surface = raw ? this.publicInteractiveSurface(raw) : null;
@@ -4301,7 +4326,7 @@ class CodexDesktopController extends CdpPageClient {
           .filter(Boolean);
       };
       const permission = ${visibleDesktopElementExpression('[data-composer-navigation-target="permissions"]')};
-      const intelligence = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
+      const intelligence = ${intelligenceTriggerElementExpression()};
       const effortAttr = intelligence ? (intelligence.getAttribute('data-selected-reasoning-effort') || '').trim() : '';
       const pickerParts = stackedPickerParts(intelligence);
       return {
@@ -4343,7 +4368,7 @@ class CodexDesktopController extends CdpPageClient {
       };
       const selectedThreadId = ${foregroundThreadIdExpression()};
       const composer = ${composerContainerElementExpression()};
-      const intelligence = ${visibleDesktopElementExpression('[data-codex-intelligence-trigger="true"]')};
+      const intelligence = ${intelligenceTriggerElementExpression()};
       const permission = ${visibleDesktopElementExpression('[data-composer-navigation-target="permissions"]')};
       return {
         selected: ${JSON.stringify(expectedThreadId)} ? selectedThreadId === ${JSON.stringify(expectedThreadId)} : Boolean(selectedThreadId),
@@ -4440,6 +4465,7 @@ module.exports = {
   createCodexDesktopController,
   defaultProfileDir,
   windowsCodexAppPath,
+  codexAppPath,
   isCodexMainPageTarget,
   normalizeCwdForMatch,
   probeCodexMainPage,

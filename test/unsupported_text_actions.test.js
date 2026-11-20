@@ -33,7 +33,7 @@ test("Codex does not publish localized thread or slash-command controls", () => 
 test("Codex runtime action and queue identities do not use localized labels", () => {
   const primaryFactsStart = cdpSource.indexOf("function composerPrimaryActionFactsSource()");
   const primaryFactsEnd = cdpSource.indexOf("function composerPrimaryActionRuntimeExpression()", primaryFactsStart);
-  const primaryFacts = cdpSource.slice(primaryFactsStart, primaryFactsEnd);
+  const primaryFacts = cdpSource.slice(primaryFactsStart, primaryFactsEnd).replace(/^\s*\/\/.*$/gm, "");
   assert.ok(primaryFactsStart >= 0 && primaryFactsEnd > primaryFactsStart);
   assert.match(primaryFacts, /submitButtonMode/);
   assert.match(primaryFacts, /isResponseInProgress/);

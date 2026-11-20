@@ -3,7 +3,9 @@
 // Contract verified against request-user-input-panel in Desktop 26.1021.31345.
 // Only the mounted native question renderer is supported; arbitrary dialogs,
 // permission prompts and questionnaire variants remain outside this capability.
-function questionOwnerSource(foregroundExpression = '') {
+const PLAN_IMPLEMENT_OPTION = 'implement-plan';
+
+function questionOwnerSource(foregroundExpression = '', includePlan = false) {
   return `
     const questionOwn = (value, key) => {
       try { return Object.getOwnPropertyDescriptor(value, key)?.value; } catch { return undefined; }
@@ -70,7 +72,9 @@ function questionOwnerSource(foregroundExpression = '') {
     };
     const questionThreadId = value => { const text = String(value || '').trim(); const match = text.match(/(?:^|:)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i); return match ? match[1] : text; };
     const questionOwners = new Map();
+    const planOwners = new Map();
     const questionVisited = new Set();
+    const questionForeground = ${foregroundExpression || 'null'};
     for (const el of [...document.querySelectorAll('button, textarea, input, [contenteditable="true"]')].filter(questionVisible).slice(0, 1200)) {
       const key = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
       let fiber = questionFiber(key ? questionOwn(el, key) : null);
@@ -83,13 +87,28 @@ function questionOwnerSource(foregroundExpression = '') {
         const questions = questionOwn(props, 'questionAndOptions');
         const submit = questionOwn(props, 'onSubmit');
         if (!Array.isArray(questions) || !questions.length || questions.length > 20 || typeof submit !== 'function') continue;
+        const isPlanRenderer = ${includePlan} && props.isPlanMode === true && props.isImmediateResponse === true
+          && typeof props.onFreeformChange === 'function' && questions.length === 1
+          && questions[0]?.options?.length === 1 && questions[0].options[0]?.id === ${JSON.stringify(PLAN_IMPLEMENT_OPTION)};
         questionStats.renderers++;
         let parent = questionFiber(questionOwn(fiber, 'return')), context = null;
         for (let n = 0; parent && n < 64; n++, parent = questionFiber(questionOwn(parent, 'return'))) {
           const p = questionOwn(parent, 'memoizedProps');
+          if (isPlanRenderer) {
+            const request = questionOwn(p, 'pendingRequest');
+            const conversationId = questionThreadId(questionOwn(p, 'conversationId'));
+            if (request?.type === 'implementPlan' && conversationId && conversationId === questionForeground
+              && typeof request.id === 'string' && request.id
+              && typeof request.turnId === 'string' && request.turnId
+              && typeof request.planContent === 'string' && request.planContent.trim()) {
+              planOwners.set(fiber, { conversationId, request, props, submit });
+              break;
+            }
+          }
           const request = questionOwn(p, 'request');
           if (questionOwn(request, 'kind') === 'questions' && questionOwn(p, 'conversationId')) { context = p; break; }
         }
+        if (planOwners.has(fiber)) continue;
         if (!context) {
           let node = questionFiber(questionOwn(fiber, 'return')), panel = null, key = null;
           for (let n = 0; node && n < 64; n++, node = questionFiber(questionOwn(node, 'return'))) {
@@ -131,13 +150,41 @@ function questionOwnerSource(foregroundExpression = '') {
       }
     }
     const questionIdentity = owner => owner ? JSON.stringify([questionThreadId(owner.conversationId), owner.mode === 'async' ? 'request_user_input_async' : owner.request.messageId, owner.requestId, owner.rows]) : '';
-    const questionForeground = ${foregroundExpression || 'null'};
     const questionRequests = new Map();
     for (const owner of questionOwners.values()) {
       if (questionForeground !== null && questionThreadId(owner.conversationId) !== questionThreadId(questionForeground)) continue;
       questionRequests.set(questionIdentity(owner), owner);
     }
     const questionOwner = questionRequests.size === 1 ? [...questionRequests.values()][0] : null;
+    const planOwner = planOwners.size === 1 ? [...planOwners.values()][0] : null;
+    const planFacts = owner => {
+      if (!owner) return null;
+      const original = owner.request.planContent.trim();
+      const cards = new Set();
+      let editing = false;
+      for (const el of document.querySelectorAll('[data-plan-selection-surface]')) {
+        if (questionThreadId(el.getAttribute('data-plan-selection-surface')) !== owner.conversationId) continue;
+        const key = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+        let node = questionFiber(key ? questionOwn(el, key) : null);
+        for (let n = 0; node && n < 32; n++, node = questionFiber(questionOwn(node, 'return'))) {
+          const props = questionOwn(node, 'memoizedProps');
+          if (props?.turnId !== owner.request.turnId || props.item?.type !== 'proposed-plan'
+            || props.item.completed !== true || typeof props.item.content !== 'string') continue;
+          cards.add(props.item.content.trim());
+          editing ||= props.isThreadPreviewCollapsed === true;
+        }
+      }
+      const markdown = cards.size === 1 ? [...cards][0] || original : original;
+      return {
+        requestId: owner.request.id,
+        identity: JSON.stringify([owner.conversationId, owner.request.turnId, owner.request.id, original, markdown]),
+        markdown,
+        // Desktop may read from the plan editor on implementation. Restrict
+        // execution to the mounted, matching unedited version.
+        canImplement: cards.size === 1 && markdown === original && !editing,
+        submitting: owner.props.isBusy === true
+      };
+    };
     const questionDiagnostics = { ownerCount: questionOwners.size, requestCount: questionRequests.size, ...questionStats,
       reason: questionOwner ? 'ready' : questionRequests.size > 1 ? 'ambiguous' : questionOwners.size ? 'background' : 'not_found' };
   `;
@@ -168,4 +215,4 @@ function validateQuestionAnswers(questions, encoded, skip = false) {
   });
 }
 
-module.exports = {questionOwnerSource, questionReadExpression, validateQuestionAnswers};
+module.exports = {PLAN_IMPLEMENT_OPTION, questionOwnerSource, questionReadExpression, validateQuestionAnswers};
