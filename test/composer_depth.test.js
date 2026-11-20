@@ -151,3 +151,36 @@ test('current Composer does not click if the action changes between readiness an
   await assert.rejects(f.controller.clickComposerPrimaryButton('queue'), /CDP target element not found/);
   assert.equal(f.getClicked(), null);
 });
+
+for (const queue of [true, false]) {
+  test(`committed shared child keeps the current ${queue ? 'queue' : 'guide'} owner`, async () => {
+    const f = fixture(4, 'follow-up', queue, false, true);
+    const old = [];
+    for (let fiber = f.primary.__reactFiber$fixture; fiber; fiber = fiber.return) old.push(fiber);
+    const rootState = {};
+    const oldRoot = { stateNode: rootState };
+    const newRoot = { stateNode: rootState, alternate: oldRoot };
+    oldRoot.alternate = newRoot;
+    old.at(-1).return = oldRoot;
+    const next = old.map(fiber => ({ memoizedProps: { ...fiber.memoizedProps } }));
+    for (let i = 0; i < old.length; i++) {
+      old[i].alternate = next[i];
+      next[i].alternate = old[i];
+      next[i].return = next[i + 1] || newRoot;
+      old[i].child = i ? old[i - 1] : null;
+      next[i].child = i ? next[i - 1] : null;
+    }
+    oldRoot.child = old.at(-1);
+    newRoot.child = next.at(-1);
+    // React bailout 将旧 host child 复用于已提交父节点，child.return 仍指向旧父节点。
+    next[1].child = old[0];
+    next[3].memoizedProps.primaryAction = { props: old[0].memoizedProps };
+    // 不应读取未挂载 alternate 的按钮状态。
+    next[0].memoizedProps.disabled = true;
+    rootState.current = newRoot;
+    const facts = await f.controller.waitForComposerSendReady(100);
+    assert.equal(facts.submission_kind, queue ? 'queue' : 'guide');
+    await f.controller.clickComposerPrimaryButton(queue ? 'queue' : 'guide');
+    assert.equal(f.getClicked(), f.primary);
+  });
+}

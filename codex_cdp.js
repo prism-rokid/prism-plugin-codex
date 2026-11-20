@@ -428,18 +428,65 @@ function composerPrimaryActionFactsSource() {
       const enabled = (element) => Boolean(
         element && !element.disabled && element.getAttribute('aria-disabled') !== 'true'
       );
+      // DOM 可以指向任一 alternate；bailout 复用 child 时，return 链并不代表已提交分支。
+      // 复用问答控件的共享子树判定，每一级祖先也必须解析当前 Fiber。
+      const composerOwn = (value, key) => {
+        try { return Object.getOwnPropertyDescriptor(value, key)?.value; } catch { return undefined; }
+      };
+    const resolveComposerFiber = fiber => {
+      if (!fiber) return null;
+      const alternate = composerOwn(fiber, 'alternate');
+      if (!alternate) return fiber;
+      let a = fiber, b = alternate;
+      for (let depth = 0; depth < 256; depth++) {
+        const parentA = composerOwn(a, 'return');
+        if (!parentA) {
+          const current = composerOwn(composerOwn(a, 'stateNode'), 'current');
+          return current === a ? fiber : current === b ? alternate : null;
+        }
+        const parentB = composerOwn(parentA, 'alternate');
+        if (!parentB) {
+          const next = composerOwn(parentA, 'return');
+          if (!next) return null;
+          a = b = next;
+          continue;
+        }
+        const childA = composerOwn(parentA, 'child'), childB = composerOwn(parentB, 'child');
+        if (childA === childB) {
+          let child = childA;
+          for (let n = 0; child && n < 50000; n++, child = composerOwn(child, 'sibling')) {
+            if (child === a) return fiber;
+            if (child === b) return alternate;
+          }
+          return null;
+        }
+        if (composerOwn(a, 'return') !== composerOwn(b, 'return')) {
+          a = parentA; b = parentB;
+        } else {
+          let found = false;
+          for (const parent of [parentA, parentB]) {
+            let child = composerOwn(parent, 'child');
+            for (let n = 0; child && n < 50000; n++, child = composerOwn(child, 'sibling')) {
+              if (child === a) { a = parent; b = parent === parentA ? parentB : parentA; found = true; break; }
+              if (child === b) { b = parent; a = parent === parentA ? parentB : parentA; found = true; break; }
+            }
+            if (found) break;
+          }
+          if (!found) return null;
+        }
+        if (composerOwn(a, 'alternate') !== b) return null;
+      }
+      return null;
+    };
+      const composerFiberCache = new Map();
+      const currentFiber = (fiber) => {
+        if (!fiber) return null;
+        if (!composerFiberCache.has(fiber)) composerFiberCache.set(fiber, resolveComposerFiber(fiber));
+        return composerFiberCache.get(fiber);
+      };
       const committedFiber = (element) => {
         const key = Object.keys(element).find((name) => name.startsWith('__reactFiber$'));
-        const fiber = key ? element[key] : null;
-        if (!fiber?.alternate) return fiber;
-        // React DOM 的 Fiber 引用可以仍指向上一轮渲染，点击前只读取已提交的分支。
-        const isCommitted = (candidate) => {
-          let root = candidate;
-          for (let depth = 0; root.return && depth < 512; depth += 1) root = root.return;
-          return root.stateNode?.current === root;
-        };
-        if (isCommitted(fiber)) return fiber;
-        return isCommitted(fiber.alternate) ? fiber.alternate : null;
+        return currentFiber(key ? composerOwn(element, key) : null);
       };
       const isPrimaryButton = (props) => props
         && typeof props.isLoading === 'boolean'
@@ -482,7 +529,7 @@ function composerPrimaryActionFactsSource() {
         let interactionBlocked = false;
         let stopping = false;
         let resumePending = false;
-        for (let current = committedFiber(element), depth = 0; current && depth < 64; current = current.return, depth += 1) {
+        for (let current = committedFiber(element), depth = 0; current && depth < 64; current = currentFiber(composerOwn(current, 'return')), depth += 1) {
           const props = current.memoizedProps;
           if (!props || typeof props !== 'object') continue;
           if (props.turn && typeof props.turn.serverInProgress === 'boolean'
