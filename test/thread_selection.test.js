@@ -32,6 +32,20 @@ test("Windows Store Codex application counts as installed without a manual overr
   assert.equal(installed, true);
 });
 
+test("Windows Store profile follows the selected Store installation", () => {
+  const profile = cdpTest.windowsProfileDir(
+    { APPDATA: "C:\\Users\\test\\AppData\\Roaming" },
+    () => true,
+    "C:\\Program Files\\WindowsApps\\OpenAI.Codex_1\\app\\ChatGPT.exe",
+  );
+  assert.equal(profile, require("node:path").join("C:\\Users\\test\\AppData\\Roaming", "Codex", "web", "Codex"));
+});
+
+test("classic installation ignores stale Store profiles", () => {
+  const profile = cdpTest.windowsProfileDir({ APPDATA: "C:/Users/test/AppData/Roaming" }, () => true, "C:/Apps/Codex/Codex.exe");
+  assert.equal(profile, require("node:path").join("C:/Users/test/AppData/Roaming", "Codex"));
+});
+
 function selectionController(overrides = {}) {
   const controller = Object.create(CodexDesktopController.prototype);
   controller.ensureReady = async () => {};
@@ -640,7 +654,7 @@ test("interrupt waits until the Composer confirms response generation stopped", 
   assert.match(clickExpression, /data-codex-composer/);
   assert.match(clickExpression, /submitButtonMode/);
   assert.match(clickExpression, /isResponseInProgress/);
-  assert.match(clickExpression, /facts\.mode !== 'stop'/);
+  assert.match(clickExpression, /facts\.mode === 'stop'/);
   assert.doesNotMatch(clickExpression, /停止\|Stop|发送\|Send|排队\|队列\|Queue/);
   assert.doesNotMatch(clickExpression, /dispatchEvent|pointerdown/);
   assert.match(waitExpression, /response_in_progress !== true/);
@@ -781,4 +795,45 @@ test("interrupt clicks only the native Stop action when dictation shares the foo
   controller.waitFor = async () => true;
   await controller.interrupt();
   assert.equal(clickedElement, stop);
+});
+
+test("model reading and menu opening support reasoning navigation anchors and legacy triggers", async () => {
+  const vm = require("node:vm");
+  for (const anchor of ["legacy", "reasoning"]) {
+    const node = (visible, label) => ({
+      getBoundingClientRect: () => ({ width: visible ? 200 : 0, height: visible ? 30 : 0 }),
+      hasAttribute: (name) => name === "data-selected-reasoning-effort",
+      getAttribute: (name) => name === "data-selected-reasoning-effort" ? "high" : null,
+      querySelector: () => null,
+      cloneNode: () => ({ querySelectorAll: (selector) => selector === "span" ? [{ children: [], innerText: label }, { children: [], innerText: "High" }] : [] }),
+    });
+    const retained = node(false, "Old model");
+    const active = node(true, "Current model");
+    const context = { document: { querySelectorAll: (selector) => {
+      if (selector === '[data-composer-navigation-target="permissions"]') return [];
+      const matches = anchor === "legacy" ? selector.includes('[data-codex-intelligence-trigger="true"]') : selector.includes('[data-composer-navigation-target="reasoning"][data-selected-reasoning-effort]');
+      return matches ? [retained, active] : [];
+    } } };
+    let clicked;
+    const controller = selectionController({
+      evaluate: async (script) => vm.runInNewContext(script, context),
+      closeVisibleMenus: async () => {},
+      clickElement: async (script) => { clicked = vm.runInNewContext(script, context); },
+      waitFor: async () => true,
+    });
+    const controls = await controller.closedComposerControls();
+    assert.equal(controls.intelligence.currentValue, "Current model High", anchor);
+    await controller.openIntelligenceMenu();
+    assert.equal(clicked, active, anchor);
+  }
+});
+
+test("model discovery refuses two distinct visible owners", async () => {
+  const vm = require("node:vm");
+  const owner = () => ({ getBoundingClientRect: () => ({ width: 200, height: 30 }) });
+  const controller = selectionController({ evaluate: async source => vm.runInNewContext(source, {
+    document: { querySelectorAll: selector => selector.includes('data-codex-intelligence-trigger') ? [owner(), owner()] : [] },
+  }) });
+  const controls = await controller.closedComposerControls();
+  assert.equal(controls.intelligence, null);
 });

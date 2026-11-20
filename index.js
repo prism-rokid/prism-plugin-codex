@@ -812,9 +812,9 @@ function interactiveSurfaceForForeground(state, transition, threadID, surface) {
   }
   const surfaceID = String(surface && surface.surface_id || "").trim();
   if (!isThreadID(threadID)) return null;
-  // A native request-user-input renderer carries its own request lifecycle;
-  // it is not a permission dialog or a control-created confirmation.
+  // Native questionnaires and plan reviews are owned by the foreground thread.
   if (surfaceID && surfaceCapability(surface) === "user_question" && surface.kind === "questionnaire") return surface;
+  if (surfaceID && surfaceCapability(surface) === "plan_review" && surface.kind === "plan_review") return surface;
   const expected = controlCreatedSurfaceByThread.get(threadID);
   const expectedSurfaceID = String(expected && expected.surfaceID || "").trim();
   const expectedCapability = String(expected && expected.capability || "").trim();
@@ -3423,6 +3423,23 @@ function historyTurnsFromTail(file, threadID, limit = HISTORY_BODY_TURN_LIMIT_MA
   return visibleTurns;
 }
 
+// Revisions are per turn. A reply/approval can add a new user anchor while
+// the earlier anchor still shares the same native task lifecycle.
+function changedHistoryTurns(turns, emittedRevisions) {
+  const currentIDs = new Set(turns.map((turn) => turn.turn_id));
+  for (const id of emittedRevisions.keys()) {
+    if (!currentIDs.has(id)) emittedRevisions.delete(id);
+  }
+  const updates = [];
+  for (const turn of turns) {
+    const previous = emittedRevisions.get(turn.turn_id);
+    if (previous === turn.revision) continue;
+    updates.push({ operation: previous === undefined ? "append" : "replace", turn });
+    emittedRevisions.set(turn.turn_id, turn.revision);
+  }
+  return updates;
+}
+
 async function* readHistoryStream(session, request = {}, signal) {
   const startedAt = Date.now();
   const threadID = firstNonEmpty(session && session.NativeThreadID, session && session.NativeSessionID);
@@ -3449,14 +3466,14 @@ async function* readHistoryStream(session, request = {}, signal) {
     const fileFingerprint = stat ? `${stat.size}:${stat.mtimeMs}` : "";
     return `${fileFingerprint}:${historyRuntimeNotices(threadID).revision}`;
   };
+  const observedFingerprint = historyFingerprint();
   const turns = historyTurnsFromTail(file, threadID, limit);
   const parsedAt = Date.now();
   const emitted = new Set();
-  let latestTurnID = "";
-  let observedFingerprint = historyFingerprint();
+  const emittedRevisions = new Map();
   for (const turn of turns) {
     emitted.add(turn.turn_id);
-    if (!latestTurnID) latestTurnID = turn.turn_id;
+    emittedRevisions.set(turn.turn_id, turn.revision);
     yield { stream_id: streamID, type: "turn", source: "initial", operation: "append", turn };
     if (emitted.size === 1) {
       logTiming("readHistoryStream.firstTurn", startedAt, {
@@ -3469,11 +3486,8 @@ async function* readHistoryStream(session, request = {}, signal) {
   }
   const updatedFingerprint = historyFingerprint();
   if (updatedFingerprint && updatedFingerprint !== observedFingerprint) {
-    const latest = historyTurnsFromTail(file, threadID, limit)[0];
-    if (latest) {
-      const operation = latest.turn_id === latestTurnID ? "replace" : "append";
-      latestTurnID = latest.turn_id;
-      yield { stream_id: streamID, type: "turn", source: "live", operation, turn: latest };
+    for (const update of changedHistoryTurns(historyTurnsFromTail(file, threadID, limit), emittedRevisions)) {
+      yield { stream_id: streamID, type: "turn", source: "live", ...update };
     }
   }
   logTiming("readHistoryStream", startedAt, {
@@ -3486,18 +3500,15 @@ async function* readHistoryStream(session, request = {}, signal) {
   yield pageEvent;
   if (!request.live) return;
 
-  if (!latestTurnID && turns[0]) latestTurnID = turns[0].turn_id;
   let fingerprint = updatedFingerprint || observedFingerprint;
   while (!signal || !signal.aborted) {
     await sleep(300);
     const nextFingerprint = historyFingerprint();
     if (!nextFingerprint || nextFingerprint === fingerprint) continue;
     fingerprint = nextFingerprint;
-    const latest = historyTurnsFromTail(file, threadID, limit)[0];
-    if (!latest) continue;
-    const operation = latest.turn_id === latestTurnID ? "replace" : "append";
-    latestTurnID = latest.turn_id;
-    yield { stream_id: streamID, type: "turn", source: "live", operation, turn: latest };
+    for (const update of changedHistoryTurns(historyTurnsFromTail(file, threadID, limit), emittedRevisions)) {
+      yield { stream_id: streamID, type: "turn", source: "live", ...update };
+    }
   }
 }
 
@@ -7440,6 +7451,7 @@ module.exports = {
     historyMessagesForDisplay,
     historyToolResultFromRolloutRow,
     historyTurnsFromTail,
+    changedHistoryTurns,
     readRecentRolloutRows,
     historyRecentScanBudget,
     boundedHistoryTurnLimit,
