@@ -1700,7 +1700,8 @@ function windowsProfileDir(env = process.env, exists = fs.existsSync, appPath = 
   const root = appData ? path.join(appData, "Codex") : path.join(os.homedir(), "AppData", "Roaming", "Codex");
   // Bind the profile to the selected installation, not stale folders left by
   // another installation. Hub normally supplies both paths explicitly.
-  const selected = appPath || env.PRISM_CODEX_APP_PATH || (process.platform === "win32" ? defaultAppPath() : "");
+  const detected = process.platform === "win32" ? defaultAppPath() : "";
+  const selected = appPath || env.PRISM_CODEX_APP_PATH || (detected && exists(detected) ? detected : "");
   if (selected) return /[\\/]WindowsApps[\\/]/i.test(selected) ? path.join(root, "web", "Codex") : root;
   const storeProfile = path.join(root, "web", "Codex");
   return exists(storeProfile) ? storeProfile : root;
