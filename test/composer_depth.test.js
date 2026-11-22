@@ -49,7 +49,9 @@ function fixture(depth, mode = 'submit', queue = true, secondOwner = false, mode
   if (modern) setModernAction(mode === 'stop' ? 'stop' : 'submit');
   let fiber = primary.__reactFiber$fixture;
   for (let i = 1; i <= depth; i++) {
-    const props = modern === 'turn' ? (i === depth ? owner : {}) : modern
+    const props = modern === 'native-submit'
+      ? (i === depth - 1 ? { primaryAction: { key: 'send', props: button }, inputInert: false } : {})
+      : modern === 'turn' ? (i === depth ? owner : {}) : modern
       ? (i === depth - 1 ? { primaryAction: { props: button }, isInteractionBlocked: false }
         : i === depth ? modernOwner : {})
       : i === depth ? owner : {};
@@ -57,6 +59,11 @@ function fixture(depth, mode = 'submit', queue = true, secondOwner = false, mode
     fiber = fiber.return;
   }
   if (secondOwner) fiber.return = { memoizedProps: { ...owner } };
+  if (modern === 'native-submit') {
+    button.type = 'submit';
+    delete button.blockedReasonOpenNonce;
+    primary.getAttribute = key => key === 'type' ? button.type : null;
+  }
   const dictation = element();
   // It shares the same owner, but lacks the primary-button contract.
   dictation.__reactFiber$fixture = { memoizedProps: {}, return: fiber };
@@ -109,6 +116,23 @@ test('deep duplicate owners fail safely and report the reason without input text
 test('owner beyond the bounded search fails safely', async () => {
   const { controller } = fixture(80);
   await assert.rejects(controller.waitForComposerSendReady(1), /composer_action_owner_ambiguous/);
+});
+
+test('the native submit variant can send without the older turn owner', async () => {
+  const f = fixture(34, 'submit', false, false, 'native-submit');
+  const facts = await f.controller.waitForComposerSendReady(100);
+  assert.equal(facts.submission_kind, 'send');
+  await f.controller.clickComposerPrimaryButton('send');
+  assert.equal(f.getClicked(), f.primary);
+  f.primary.disabled = true;
+  await assert.rejects(f.controller.clickComposerPrimaryButton('send'), /control_target_stale/);
+});
+
+test('a native composer action without submit semantics cannot send', async () => {
+  const f = fixture(34, 'submit', false, false, 'native-submit');
+  f.primary.__reactFiber$fixture.memoizedProps.type = 'button';
+  await assert.rejects(f.controller.clickComposerPrimaryButton('send'), /control_target_stale/);
+  assert.equal(f.getClicked(), undefined);
 });
 
 for (const [mode, queue, expected] of [['submit', true, 'send'], ['stop', true, 'queue']]) {
