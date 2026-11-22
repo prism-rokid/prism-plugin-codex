@@ -1,0 +1,39 @@
+id: dot
+schema_version: 1
+display_name: Dot
+description: Connects Prism to the managed ChatGPT Dot window.
+icon_url: https://rokid-xr.oss-cn-hangzhou.aliyuncs.com/dev/prism/agents-icons/dot.png
+version: 0.1.0
+plugin_protocol_version: "4"
+min_hub_version: 0.1.24
+integration_mode: desktop-automation
+transport: process
+runtime_modes: [desktop]
+default_runtime_mode: desktop
+runtime_controls:
+  desktop: {}
+managed_launch_specs:
+  - kind: desktop-app
+    app: dot
+    ready: probe
+    shared_window: chatgpt-single-window-v2
+managed_launch: true
+runtime_dependencies:
+  node: ">=22.13.1 <23.0.0"
+command: ["${runtime.node}", "--max-old-space-size=192", "index.cjs"]
+capabilities:
+  native_visible_input: true
+  native_visible_output: true
+  can_attach_session: true
+  can_start_session_with_message: false
+  can_open_draft: false
+  can_list_sessions: true
+  can_read_history: true
+  can_interrupt: false
+  can_approval: false
+  can_forward_sync: true
+  can_reverse_sync: true
+  can_plugin_wide_watch: true
+  can_wait_run: true
+  can_read_status: true
+  can_control_session: true

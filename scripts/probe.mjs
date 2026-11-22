@@ -3,7 +3,9 @@ import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
+const root = process.argv[2]
+  ? resolve(process.argv[2])
+  : resolve(fileURLToPath(new URL("..", import.meta.url)));
 const manifest = await readFile(resolve(root, "pluginbridge-plugin.yaml"), "utf8");
 const id = manifest.match(/^id:\s*(.+)$/m)?.[1]?.trim();
 const raw = manifest.match(/^command:\s*(\[[^\n]+\])$/m)?.[1];

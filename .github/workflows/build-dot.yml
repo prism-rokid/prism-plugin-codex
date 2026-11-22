@@ -1,0 +1,70 @@
+name: Build Dot plugin
+
+on:
+  pull_request:
+    paths:
+      - "dot/**"
+      - "shared/**"
+      - "scripts/stage-release.mjs"
+      - "scripts/probe.mjs"
+      - "scripts/create-release-metadata.mjs"
+      - ".github/workflows/build-dot.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-arm64
+            runner: macos-15
+          - target: macos-x64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    env:
+      PRISM_PLATFORM: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.1
+          cache: npm
+          cache-dependency-path: dot/package-lock.json
+      - run: npm ci --prefix dot
+      - run: npm test --prefix dot
+      - run: npm prune --omit=dev --prefix dot
+      - name: Verify and package the staged plugin
+        shell: bash
+        run: |
+          staged=$(node scripts/stage-release.mjs dot)
+          node scripts/probe.mjs "$staged"
+          tar -C "$staged" -czf "$PWD/release/$(basename "$staged").tar.gz" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dot-release-${{ matrix.target }}
+          path: release/dot-*.tar.gz
+          if-no-files-found: error
+
+  metadata:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.1
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dot-release-*
+          path: release-artifacts
+          merge-multiple: true
+      - run: node scripts/create-release-metadata.mjs release-artifacts dot
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dot-release-metadata
+          path: release-artifacts/plugin-release.json
+          if-no-files-found: error

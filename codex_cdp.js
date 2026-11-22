@@ -6,6 +6,7 @@ const path = require("path");
 const crypto = require("crypto");
 const { spawn, execFile, execFileSync } = require("child_process");
 const { promisify } = require("util");
+const { readSharedWindowLease, codexNavigation, loopbackOrigin } = require("./shared/desktop-host.cjs");
 
 function requireCdpRuntime() {
   return require("@rokid-prism/pluginbridge-plugin-sdk/cdp-runtime");
@@ -42,6 +43,10 @@ function normalizeCwdForMatch(value) {
 const DEFAULT_CONNECT_TIMEOUT_MS = 15000;
 const DEFAULT_READY_TIMEOUT_MS = 15000;
 const THREAD_SELECTION_TIMEOUT_MS = process.platform === "win32" ? 9000 : 4000;
+const SHARED_SWITCH_FAILURES = new Set([
+  "desktop_busy", "desktop_draft", "sidebar_opening", "codex_thread_not_visible",
+  "codex_thread_ambiguous", "codex_thread_disabled", "codex_previous_thread_unavailable",
+]);
 
 // These vector prefixes are version-scoped Codex Desktop capabilities. They
 // are deliberately preferred over localized labels so a Chinese/English UI
@@ -438,7 +443,7 @@ function composerPrimaryActionFactsSource() {
       const alternate = composerOwn(fiber, 'alternate');
       if (!alternate) return fiber;
       let a = fiber, b = alternate;
-      for (let depth = 0; depth < 256; depth++) {
+      for (let depth = 0; depth < 2048; depth++) {
         const parentA = composerOwn(a, 'return');
         if (!parentA) {
           const current = composerOwn(composerOwn(a, 'stateNode'), 'current');
@@ -485,22 +490,31 @@ function composerPrimaryActionFactsSource() {
         return composerFiberCache.get(fiber);
       };
       const committedFiber = (element) => {
-        const key = Object.keys(element).find((name) => name.startsWith('__reactFiber$'));
-        return currentFiber(key ? composerOwn(element, key) : null);
+        const keys = Object.getOwnPropertyNames(element);
+        const key = keys.find((name) => name.startsWith('__reactFiber$'));
+        const fiber = key && composerOwn(element, key);
+        const propsKey = key && '__reactProps$' + key.slice('__reactFiber$'.length);
+        const props = propsKey && composerOwn(element, propsKey);
+        const alternate = fiber && composerOwn(fiber, 'alternate');
+        // React stores the committed host props on the rendered button.
+        if (props && alternate && (fiber.memoizedProps === props) !== (alternate.memoizedProps === props)) {
+          return fiber.memoizedProps === props ? fiber : alternate;
+        }
+        return currentFiber(fiber);
       };
-      const isPrimaryButton = (props) => props
-        && typeof props.isLoading === 'boolean'
-        && typeof props.disabled === 'boolean'
-        && typeof props.ariaLabel === 'string'
-        && props.Icon
-        && typeof props.onClick === 'function';
+      const isPrimaryButton = (props) => props && typeof props.ariaLabel === 'string' &&
+        typeof props.onClick === 'function' && (
+          (typeof props.isLoading === 'boolean' && typeof props.disabled === 'boolean' && props.Icon) ||
+          (props.supportsMorphing === true && Object.prototype.hasOwnProperty.call(props, 'blockedReasonOpenNonce') &&
+            Object.prototype.hasOwnProperty.call(props, 'onPreviewClick'))
+        );
       const modernAction = (button, view, owner) => {
         const turn = owner?.turn;
         if (!view || !turn || typeof turn.serverInProgress !== 'boolean'
           || typeof turn.hasMessageContent !== 'boolean'
-          || typeof turn.isAeon !== 'boolean'
           || typeof owner.submitDisabled !== 'boolean'
-          || (owner.followUpAction !== 'queue' && owner.followUpAction !== 'steer')) return null;
+          || (turn.serverInProgress && (typeof turn.isAeon !== 'boolean' ||
+              (owner.followUpAction !== 'queue' && owner.followUpAction !== 'steer')))) return null;
         // 新版的发送、排队和引导共用按钮组件。停止沿用原生回调身份；
         // 恢复、语音和听写也用相似按钮，但没有文本提交专用的属性。
         const stop = button.onClick === owner.onStop;
@@ -510,7 +524,7 @@ function composerPrimaryActionFactsSource() {
           mode: stop ? 'stop' : submit ? 'submit' : 'other',
           response_in_progress: stop || turn.serverInProgress,
           queueing_enabled: !turn.isAeon && owner.followUpAction === 'queue',
-          submit_disabled: owner.submitDisabled || button.isLoading,
+          submit_disabled: Boolean(owner.submitDisabled || button.disabled || button.isLoading || button.blockedReason),
           stopping: owner.isStopping === true,
           resume_pending: owner.isResumePending === true,
           interaction_blocked: view.isInteractionBlocked === true || owner.interactionsEnabled !== true,
@@ -529,7 +543,8 @@ function composerPrimaryActionFactsSource() {
         let interactionBlocked = false;
         let stopping = false;
         let resumePending = false;
-        for (let current = committedFiber(element), depth = 0; current && depth < 64; current = currentFiber(composerOwn(current, 'return')), depth += 1) {
+        const leaf = committedFiber(element);
+        for (let current = leaf, depth = 0; current && depth < 64; current = currentFiber(composerOwn(current, 'return')), depth += 1) {
           const props = current.memoizedProps;
           if (!props || typeof props !== 'object') continue;
           if (props.turn && typeof props.turn.serverInProgress === 'boolean'
@@ -585,8 +600,8 @@ function composerPrimaryActionFactsSource() {
       const hasNativePayload = editableSurfaces.some((element) => Boolean(
         String(element.value ?? element.innerText ?? element.textContent ?? '').trim()
       )) || prismComposerAttachmentState().present === true;
-      let footer = null;
-      for (let node = composer; node; node = node.parentElement) {
+      let footer = composer.closest?.('[data-thread-scroll-footer="true"]') || null;
+      for (let node = composer; !footer && node; node = node.parentElement) {
         if ([...node.querySelectorAll('[data-composer-navigation-target]')].some(visible)) {
           footer = node;
           break;
@@ -598,11 +613,14 @@ function composerPrimaryActionFactsSource() {
         .filter((element) => !element.hasAttribute('data-composer-navigation-target'))
         .filter((element) => String(element.getAttribute('aria-haspopup') || '').toLowerCase() !== 'menu');
       const actionCandidates = [];
+      let otherAction;
       for (const element of candidates) {
         const state = actionState(element);
-        if (state) actionCandidates.push({ element, state });
+        if (state?.mode === 'other') otherAction = { ...state, element };
+        else if (state) actionCandidates.push({ element, state });
       }
-      if (actionCandidates.length !== 1) return { usable: false, reason: 'composer_action_owner_ambiguous' };
+      if (!actionCandidates.length && otherAction) return { ...otherAction, usable: true, enabled: enabled(otherAction.element) };
+      if (actionCandidates.length !== 1) return { usable: false, reason: 'composer_action_owner_ambiguous', recognized: actionCandidates.length };
       const { element, state } = actionCandidates[0];
       return {
         ...state,
@@ -1774,8 +1792,32 @@ function isCodexMainPageTarget(target) {
   return String(target.url || "").trim() === "app://-/index.html";
 }
 
-function selectCodexMainPageTarget(targets) {
-  return Array.isArray(targets) ? targets.find(isCodexMainPageTarget) || null : null;
+// Read-only binding for the host companion. Its native workspace contains many threads.
+async function bindCodexWindow(target) {
+  const origin = loopbackOrigin(target?.cdp_origin);
+  if (!origin || !target.shared_window || !/^[a-z0-9_-]{1,128}$/iu.test(target.target_id)) throw new Error("Invalid shared workspace");
+  const response = await fetch(origin + "/json/list", { redirect: "error", signal: AbortSignal.timeout(1500) });
+  const matches = response.ok && (await response.json()).filter((page) => isCodexMainPageTarget(page) && page.id === target.target_id &&
+    page.webSocketDebuggerUrl === origin.replace("http:", "ws:") + "/devtools/page/" + target.target_id);
+  if (matches?.length !== 1) throw new Error("Shared Codex workspace unavailable");
+  const page = new CdpPageClient({ commandTimeoutMs: 3500 });
+  try {
+    await page.connectToPage(matches[0].webSocketDebuggerUrl, []);
+    if (!await page.evaluate(foregroundThreadIdExpression(), { awaitPromise: false })) throw new Error("Select a native Codex thread before binding");
+    return { ok: true, action: "desktop.bind", thread_id: "codex-workspace" };
+  } finally {
+    await page.close();
+  }
+}
+
+function selectCodexMainPageTarget(targets, { hostLease = readSharedWindowLease(), preferredID = "" } = {}) {
+  const candidates = (Array.isArray(targets) ? targets : []).filter((target) =>
+    isCodexMainPageTarget(target) && (!hostLease || hostLease.shared_window || target.id !== hostLease.target_id),
+  );
+  const sharedID = hostLease?.shared_window ? hostLease.target_id : "";
+  return (sharedID && candidates.find((target) => target.id === sharedID)) ||
+    (preferredID && candidates.find((target) => target.id === preferredID)) ||
+    (candidates.length === 1 ? candidates[0] : null);
 }
 
 // Capability probing must not launch Codex, wait for a composer, or contend
@@ -2136,9 +2178,69 @@ class CodexDesktopController extends CdpPageClient {
       this.pageTarget = target;
       await this.connectToPage(target.webSocketDebuggerUrl);
     }
+    const hostLease = readSharedWindowLease();
+    const otherForeground = hostLease?.shared_window && this.pageTarget?.id === hostLease.target_id &&
+      await this.evaluate(`(() => {
+        if (${foregroundThreadIdExpression()}) return false;
+        return [...document.querySelectorAll('[data-sidebar-destination][aria-current="page"]')]
+          .some((node) => node.getClientRects().length && !node.closest('[hidden],[inert],[aria-hidden="true"]'));
+      })()`);
+    if (otherForeground || (hostLease && !hostLease.shared_window && this.pageTarget?.id === hostLease.target_id)) {
+      const sharedTarget = hostLease?.shared_window && this.pageTarget?.id === hostLease.target_id;
+      const canSwitch = sharedTarget && otherForeground && this.options.canSwitchSharedWindow?.();
+      const previous = canSwitch && await this.restoreSharedWindowCodexThread();
+      const switchFailure = SHARED_SWITCH_FAILURES.has(previous) ? previous : "";
+      if (!previous || switchFailure) {
+        await this.close();
+        if (previous === "desktop_draft") throw new Error("The shared ChatGPT window has an unsent draft");
+        if (previous === "desktop_busy") throw new Error("The shared ChatGPT window is handling a desktop action");
+        const error = new Error(`Codex desktop surface is unavailable while another agent is in the foreground${switchFailure ? ` (${switchFailure})` : ""}`);
+        if (sharedTarget && otherForeground && !canSwitch) {
+          error.code = "desktop_agent_foreground";
+        }
+        throw error;
+      }
+      let restored = false;
+      for (let attempt = 0; attempt < 30; attempt++) {
+        const currentThread = await this.evaluate(foregroundThreadIdExpression());
+        if (currentThread && (currentThread === previous ||
+            (!currentThread.includes(":") && previous.endsWith(`:${currentThread}`)) ||
+            (!previous.includes(":") && currentThread.endsWith(`:${previous}`)))) {
+          restored = true;
+          break;
+        }
+        await sleep(100);
+      }
+      if (!restored) throw new Error("Could not verify the restored Codex conversation");
+    }
     await this.waitForReady();
     await this.installInteractiveSurfaceCapabilityTracker();
     return this;
+  }
+
+  async restoreSharedWindowCodexThread() {
+    const requested = this.options.sharedWindowThreadID?.() || "";
+    const cwd = this.options.sharedWindowThreadCwd?.() || "";
+    const navigate = async (threadID) => {
+      const expression = codexNavigation(threadID);
+      const result = await this.evaluate(expression);
+      if (result !== "sidebar_opening") return result;
+      await sleep(200);
+      return this.evaluate(expression);
+    };
+    let result = await navigate(requested);
+    if (result === "codex_thread_not_visible" && requested && cwd) {
+      const projectID = await this.projectIdForCwd(normalizeCwdForMatch(cwd)).catch(() => "");
+      if (projectID && (await this.ensureProjectExpanded(projectID).catch(() => null))?.expanded === true) {
+        result = await navigate(requested);
+      }
+    }
+    if (result !== "codex_thread_not_visible" || !requested) return result;
+    // Older rows sometimes only mount after returning to the Codex surface.
+    // Callers still select and verify the requested thread before using it.
+    const previous = await navigate("");
+    if (previous === "desktop_busy" || previous === "desktop_draft") return previous;
+    return previous && !SHARED_SWITCH_FAILURES.has(previous) ? previous : result;
   }
 
   // Track the DOM relationship between the permission control and its menu.
@@ -2251,7 +2353,7 @@ class CodexDesktopController extends CdpPageClient {
       try {
         const response = await fetch(listUrl, { cache: "no-store" });
         const targets = await response.json();
-        const page = selectCodexMainPageTarget(targets);
+        const page = selectCodexMainPageTarget(targets, { preferredID: this.pageTarget?.id });
         if (page) {
           return page;
         }
@@ -2402,6 +2504,7 @@ class CodexDesktopController extends CdpPageClient {
     // timeout actionable while keeping user text out of Hub/API diagnostics.
     const diagnostic = lastFacts ? {
       reason: String(lastFacts.reason || ""),
+      recognized: lastFacts.recognized,
       usable: lastFacts.usable === true,
       enabled: lastFacts.enabled === true,
       mode: String(lastFacts.mode || ""),
@@ -3193,10 +3296,11 @@ class CodexDesktopController extends CdpPageClient {
     // The sidebar row click is the Windows recovery path: the protocol deep
     // link activates the app through the OS handler there and can leave the
     // workspace without its composer. Other platforms keep the deep link.
-    let clicked = process.platform === "win32"
+    const requireWindowScopedSelect = process.platform === "win32" || Boolean(this.pageTarget && readSharedWindowLease());
+    let clicked = requireWindowScopedSelect
       ? await this.clickSidebarThreadRow(normalized).catch(() => false)
       : false;
-    if (!clicked && process.platform === "win32" && cwd) {
+    if (!clicked && requireWindowScopedSelect && cwd) {
       // Collapsed projects do not render their thread rows; expand the owning
       // project before giving up on the in-page switch.
       const projectId = await this.projectIdForCwd(normalizeCwdForMatch(cwd)).catch(() => "");
@@ -3218,7 +3322,7 @@ class CodexDesktopController extends CdpPageClient {
         await sleep(200);
       }
     }
-    if (process.platform === "win32") {
+    if (requireWindowScopedSelect) {
       // The protocol deep link activates Codex through the OS handler on
       // Windows and can leave the workspace mounted without its composer, so
       // never fall back to it there: report a normal control failure and let
@@ -4462,6 +4566,7 @@ function createCodexDesktopController(options = {}) {
 }
 
 module.exports = {
+  bindCodexWindow,
   CodexDesktopController,
   createCodexDesktopController,
   defaultProfileDir,

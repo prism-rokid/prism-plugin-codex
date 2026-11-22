@@ -6,7 +6,7 @@ icon_url: https://registry.npmmirror.com/@lobehub/icons-static-avatar/latest/fil
 icon_svg_url: https://registry.npmmirror.com/@lobehub/icons-static-svg/latest/files/icons/codex.svg
 version: 0.1.56
 plugin_protocol_version: "4"
-min_hub_version: 0.1.0
+min_hub_version: 0.1.24
 integration_mode: desktop-automation
 transport: process
 runtime_modes: [desktop]
@@ -15,6 +15,7 @@ managed_launch_specs:
   - kind: desktop-app
     app: codex
     ready: probe
+    shared_window: chatgpt-single-window-v2
 runtime_controls:
   desktop:
     model: interactive
@@ -31,7 +32,7 @@ managed_launch: true
 # guardrail as well so malformed desktop data cannot grow one Plugin process
 # until it exhausts the host memory.
 runtime_dependencies:
-  node: ">=22.0.0 <23.0.0"
+  node: ">=22.13.1 <23.0.0"
 command: ["${runtime.node}", "--max-old-space-size=320", "index.js"]
 capabilities:
   native_visible_input: true

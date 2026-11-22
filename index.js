@@ -9,7 +9,9 @@ const path = require("path");
 const { execFile, spawn } = require("child_process");
 const { promisify } = require("util");
 const crypto = require("crypto");
-const { createCodexDesktopController, normalizeCwdForMatch, probeCodexMainPage, windowsCodexAppPath } = require("./codex_cdp");
+const { AsyncLocalStorage } = require("node:async_hooks");
+const { bindCodexWindow, createCodexDesktopController, normalizeCwdForMatch, probeCodexMainPage, windowsCodexAppPath } = require("./codex_cdp");
+const { desktopHostCoordination, withDesktopHostLock } = require("./shared/desktop-host.cjs");
 
 const execFileAsync = promisify(execFile);
 const CODEX_ROOT = process.platform === "win32"
@@ -88,6 +90,7 @@ const liveControlOptionsCache = new Map();
 let desktopWatchTimer = null;
 let desktopWatchInFlight = false;
 let desktopControlInFlight = false;
+const desktopControlScope = new AsyncLocalStorage();
 // A control can finish after the native UI has already accepted a send, while
 // the watcher is still barred from reading that transient DOM. Preserve the
 // requested refresh until the exclusive CDP section releases it.
@@ -500,6 +503,9 @@ async function codexDesktopController() {
       createCodexDesktopController({
         connectTimeoutMs: 15000,
         readyTimeoutMs: 15000,
+        canSwitchSharedWindow: () => desktopControlScope.getStore()?.active === true,
+        sharedWindowThreadID: () => desktopControlScope.getStore()?.threadID,
+        sharedWindowThreadCwd: () => desktopControlScope.getStore()?.cwd,
       }),
     );
   }
@@ -5289,15 +5295,14 @@ async function selectCodexConversation(threadID = "") {
     throw new Error("codex conversation.select requires a resolved Codex thread id");
   }
   return runExclusiveDesktopControl(async () => {
-    const controller = await codexDesktopController();
-    const alreadySelected = await controller.isThreadSelected(threadID);
-    // The owning project cwd lets the Windows sidebar switch expand a collapsed
-    // project before clicking the thread row.
     let cwd = "";
     try {
       const thread = await findThreadByID(threadID);
       cwd = firstNonEmpty(thread && thread.cwd);
     } catch {}
+    Object.assign(desktopControlScope.getStore(), { threadID, cwd });
+    const controller = await codexDesktopController();
+    const alreadySelected = await controller.isThreadSelected(threadID);
     const selectResult = await controller.selectThread(threadID, cwd);
     // selectThread reports that a native switch was dispatched (a sidebar row
     // click on Windows, the protocol deep link elsewhere). The only meaningful
@@ -5974,6 +5979,7 @@ async function discovery() {
       state_db: stateDBPath(),
       session_index: SESSION_INDEX,
       mode: "sqlite-thread-index-plus-automation",
+      desktop_host_coordination: desktopHostCoordination,
     },
     Verified: currentCapability.Available,
     Detail: currentCapability.Available
@@ -6096,6 +6102,7 @@ async function send(session, msg) {
       throw new Error("codex send requires text or attachments");
     }
     if (isThreadID(threadID)) {
+      Object.assign(desktopControlScope.getStore(), { threadID, cwd: firstNonEmpty(session && session.Cwd) });
       runContext = {
         thread_id: threadID,
         started_at: sendStartedAt,
@@ -6949,14 +6956,18 @@ function enqueueDesktopControlMenuWarm(operation) {
 }
 
 async function runExclusiveDesktopControl(operation) {
+  if (desktopControlScope.getStore()?.active) return operation();
   return enqueueDesktopControlMenuWarm(async () => {
+    const scope = { active: true };
     desktopControlInFlight = true;
     try {
       while (desktopWatchInFlight) {
         await sleep(25);
       }
-      return await operation();
+      const run = () => desktopControlScope.run(scope, operation);
+      return process.platform === "darwin" ? await withDesktopHostLock(run) : await run();
     } finally {
+      scope.active = false;
       desktopControlInFlight = false;
       flushDeferredDesktopWatchBursts();
     }
@@ -6964,6 +6975,13 @@ async function runExclusiveDesktopControl(operation) {
 }
 
 async function pollDesktopWatch() {
+  if (process.platform === "darwin" && desktopWatchSubscribers.size > 0 && !desktopControlInFlight && !desktopWatchInFlight) {
+    return withDesktopHostLock(pollDesktopWatchUnlocked, { skipIfBusy: true });
+  }
+  return pollDesktopWatchUnlocked();
+}
+
+async function pollDesktopWatchUnlocked() {
   if (desktopWatchSubscribers.size === 0) return;
   if (desktopWatchInFlight) {
     recordDesktopWatchMetric("polls_skipped_in_flight");
@@ -7067,6 +7085,16 @@ async function pollDesktopWatch() {
       }
     }
   } catch (error) {
+    if (error?.code === "desktop_agent_foreground") {
+      desktopWatchState.consecutiveInvalidPolls = 0;
+      for (const subscriber of desktopWatchSubscribers.values()) {
+        const detail = subscriber.detailSnapshot;
+        if (detail && !detail.detail_stale && detail.native_conversation_id === desktopWatchState.lastValidThreadID) {
+          emitDesktopWatchStale(subscriber, detail.native_conversation_id);
+        }
+      }
+      return;
+    }
     pollFailed = true;
     recordDesktopWatchMetric("polls_failed");
     console.error(`[codex] desktop watcher poll failed: ${error && error.message ? error.message : String(error)}`);
@@ -7392,10 +7420,10 @@ const adapter = {
   discover() {
     return discovery();
   },
-  startSessionWithMessage,
-	openDraft,
-	controlDraft,
-	startDraftWithMessage,
+  startSessionWithMessage: (req) => runExclusiveDesktopControl(() => startSessionWithMessage(req)),
+  openDraft: (req) => runExclusiveDesktopControl(() => openDraft(req)),
+  controlDraft: (req) => runExclusiveDesktopControl(() => controlDraft(req)),
+  startDraftWithMessage: (req) => runExclusiveDesktopControl(() => startDraftWithMessage(req)),
   listSessions,
   attachSession,
   readHistoryStream,
@@ -7403,11 +7431,13 @@ const adapter = {
   // conversation.messages query. It is removed with that API route.
   readHistory,
   readStatus,
-  controlSession,
+  controlSession: (req) => req?.action === "desktop.bind" && req.session?.PluginID === "codex" &&
+    !req.session.NativeSessionID && !req.session.NativeThreadID
+    ? bindCodexWindow(req.target) : runExclusiveDesktopControl(() => controlSession(req)),
   subscribe,
   subscribePlugin,
   readAgentUsage,
-  resolveApproval,
+  resolveApproval: (req) => runExclusiveDesktopControl(() => resolveApproval(req)),
   send,
   interrupt,
   verifyVisibility,

@@ -6,6 +6,20 @@ This release uses the public `@rokid-prism/pluginbridge-plugin-sdk` package and 
 Hub-managed Node 22 runtime. It does not search for an SDK or a Node binary in
 the Prism application tree.
 
+## Dot 开发构建
+
+`dot/` 是独立的 PluginBridge 插件。它与 Codex 分别安装，通过 macOS Hub 共用同一个 ChatGPT 托管窗口和 `shared/desktop-host.cjs`。
+
+```sh
+npm ci --prefix dot
+npm test --prefix dot
+PRISM_PLATFORM=macos-arm64 node scripts/stage-release.mjs dot
+node scripts/probe.mjs release/dot-0.1.0-macos-arm64
+```
+
+协议探测可以在未绑定桌面时运行，此时 `available=false`。正式账户联调通过 Hub 绑定共用窗口后进行。
+Build Dot plugin 工作流生成 macOS 安装包与 Dot 的 Registry 元数据。
+
 ## 本地问题分析与贡献
 
 仓库默认带有 [`prism-plugin-maintainer`](.agents/skills/prism-plugin-maintainer/SKILL.md)，用于本地分析、修复和验证插件问题，无法解决时整理脱敏 Issue 草稿。支持 `.agents/skills` 的智能体可发现它，其他客户端可要求智能体直接阅读该文件。默认不发布；先准备 diff、检查结果、目标和正文供审阅，用户可一次授权 commit、推送与 PR 整条流程，或明确授权无法解决时自动提交 Issue。范围内已有授权不重复询问。公开提交和数据处理说明见 [SDK README](https://github.com/Rokid-Prism/prism-plugin-sdk#本地问题分析与贡献-skill)。

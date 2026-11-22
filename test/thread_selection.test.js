@@ -89,6 +89,50 @@ test("already foreground thread does not invoke the deep link", async () => {
   assert.equal(calls, 0);
 });
 
+test("shared window selection opens the sidebar and expands the requested thread's project", async () => {
+  const cwd = "/repo/prism";
+  const results = ["sidebar_opening", "codex_thread_not_visible", "workspace:" + THREAD_ID];
+  const controller = selectionController({
+    options: { sharedWindowThreadID: () => THREAD_ID, sharedWindowThreadCwd: () => cwd },
+    evaluate: async (script) => {
+      assert.ok(script.endsWith(`("${THREAD_ID}")`));
+      return results.shift();
+    },
+    projectIdForCwd: async (path) => {
+      assert.equal(path, cwd);
+      return "prism";
+    },
+    ensureProjectExpanded: async (id) => {
+      assert.equal(id, "prism");
+      return { expanded: true };
+    },
+  });
+  assert.equal(await controller.restoreSharedWindowCodexThread(), "workspace:" + THREAD_ID);
+  assert.equal(results.length, 0);
+});
+
+test("shared window selection never expands a project after a draft blocks navigation", async () => {
+  const controller = selectionController({
+    options: { sharedWindowThreadID: () => THREAD_ID, sharedWindowThreadCwd: () => "/repo/prism" },
+    evaluate: async () => "desktop_draft",
+    projectIdForCwd: async () => assert.fail("must preserve the local draft"),
+  });
+  assert.equal(await controller.restoreSharedWindowCodexThread(), "desktop_draft");
+});
+
+test("shared window restores a visible previous thread when the requested row is not mounted", async () => {
+  const previousThread = "workspace:22222222-2222-4222-8222-222222222222";
+  const controller = selectionController({
+    options: { sharedWindowThreadID: () => THREAD_ID },
+    evaluate: async (script) => {
+      if (script.endsWith(`("${THREAD_ID}")`)) return "codex_thread_not_visible";
+      assert.ok(script.endsWith('("")'));
+      return previousThread;
+    },
+  });
+  assert.equal(await controller.restoreSharedWindowCodexThread(), previousThread);
+});
+
 test("selection timeout returns a structured incomplete result", async () => {
   const controller = selectionController({
     openThreadByDeepLink: async () => {
@@ -197,6 +241,18 @@ test("Codex CDP target selection ignores auxiliary pages", () => {
   assert.deepEqual(selectCodexMainPageTarget(targets), targets[3]);
   assert.equal(selectCodexMainPageTarget([targets[0]]), null);
   assert.equal(selectCodexMainPageTarget(targets.slice(0, 3)), null);
+});
+
+test("Codex preserves its own desktop target alongside a leased Dot window", () => {
+  const codex = { id: "codex", type: "page", url: "app://-/index.html", webSocketDebuggerUrl: "ws://codex" };
+  const dot = { id: "dot", type: "page", url: "app://-/index.html", webSocketDebuggerUrl: "ws://dot" };
+  assert.equal(selectCodexMainPageTarget([dot, codex], { hostLease: { target_id: "dot" } }), codex);
+  assert.equal(selectCodexMainPageTarget([dot, codex], { hostLease: null, preferredID: "codex" }), codex);
+  assert.equal(selectCodexMainPageTarget([dot, codex], { hostLease: null }), null);
+  assert.equal(selectCodexMainPageTarget([dot, codex], {
+    hostLease: { target_id: "codex", shared_window: true }, preferredID: "dot",
+  }), codex);
+  assert.equal(selectCodexMainPageTarget([dot], { hostLease: { target_id: "dot" } }), null);
 });
 
 test("CDP capability probe is a bounded main-page reachability check", () => {

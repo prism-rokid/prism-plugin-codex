@@ -184,3 +184,28 @@ for (const queue of [true, false]) {
     assert.equal(f.getClicked(), f.primary);
   });
 }
+
+test('long committed host trees still identify the submitted button', async () => {
+  const f = fixture(30, 'submit', true, false, true);
+  const leaf = f.primary.__reactFiber$fixture;
+  leaf.stateNode = f.primary;
+  // React can keep an alternate on the same DOM button below a deeply nested host.
+  let current = leaf;
+  while (current.return) current = current.return;
+  for (let depth = 0; depth < 300; depth++) current = current.return = { memoizedProps: {} };
+  const root = current;
+  let child = leaf;
+  while (child) {
+    child.alternate = { alternate: child, memoizedProps: {} };
+    if (child.child) {
+      child.child.alternate.return = child.alternate;
+      child.alternate.child = child.child.alternate;
+    }
+    if (child.return) child.return.child = child;
+    child = child.return;
+  }
+  root.stateNode = root.alternate.stateNode = { current: root };
+  assert.equal((await f.controller.waitForComposerSendReady(100)).submission_kind, 'send');
+  await f.controller.clickComposerPrimaryButton('send');
+  assert.equal(f.getClicked(), f.primary);
+});

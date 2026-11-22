@@ -1,5 +1,7 @@
+# Dependencies, staged bundles and CI release metadata
 node_modules/
-release/
+/release/
+/release-artifacts/
 *.tgz
 
 # Locally compiled macOS automation helpers
@@ -11,6 +13,11 @@ bin/*.build.json
 coverage/
 test-results/
 .cache/
+.prism/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
 .DS_Store
 .idea/
 .vscode/

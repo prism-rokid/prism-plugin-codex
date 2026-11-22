@@ -1,0 +1,17 @@
+{
+  "name": "dot-automation-plugin",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Prism adapter for the managed ChatGPT Dot window",
+  "main": "index.cjs",
+  "scripts": {
+    "test": "node --test test/*.test.cjs"
+  },
+  "dependencies": {
+    "@rokid-prism/pluginbridge-plugin-sdk": "0.1.1"
+  },
+  "engines": {
+    "node": ">=22.13.1 <23"
+  },
+  "license": "MIT"
+}
