@@ -90,7 +90,7 @@ test("already foreground thread does not invoke the deep link", async () => {
 });
 
 test("shared window selection opens the sidebar and expands the requested thread's project", async () => {
-  const cwd = "/repo/prism";
+  const cwd = require("node:path").resolve("repo", "prism");
   const results = ["sidebar_opening", "codex_thread_not_visible", "workspace:" + THREAD_ID];
   const controller = selectionController({
     options: { sharedWindowThreadID: () => THREAD_ID, sharedWindowThreadCwd: () => cwd },
@@ -111,13 +111,13 @@ test("shared window selection opens the sidebar and expands the requested thread
   assert.equal(results.length, 0);
 });
 
-test("shared window selection never expands a project after a draft blocks navigation", async () => {
+test("shared window selection never expands a project while attachments block navigation", async () => {
   const controller = selectionController({
     options: { sharedWindowThreadID: () => THREAD_ID, sharedWindowThreadCwd: () => "/repo/prism" },
-    evaluate: async () => "desktop_draft",
-    projectIdForCwd: async () => assert.fail("must preserve the local draft"),
+    evaluate: async () => "desktop_attachments",
+    projectIdForCwd: async () => assert.fail("must preserve the local attachments"),
   });
-  assert.equal(await controller.restoreSharedWindowCodexThread(), "desktop_draft");
+  assert.equal(await controller.restoreSharedWindowCodexThread(), "desktop_attachments");
 });
 
 test("shared window restores a visible previous thread when the requested row is not mounted", async () => {
