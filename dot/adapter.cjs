@@ -5,6 +5,7 @@ const { createHash } = require("node:crypto");
 
 const MAX_HISTORY = 20;
 const HISTORY_READY_ATTEMPTS = 16;
+const HISTORY_RECHECK_MS = 15000;
 // Cover the gap between a native receipt and the first typing indication.
 const REPLY_START_GRACE_MS = 8000;
 const HISTORY_FAILURE = "The native Dot history could not be read for the bound conversation.";
@@ -152,6 +153,7 @@ function createDotAdapter({ backend, PluginAdapterError, ledger, settings = {} }
   const runs = new Map();
   let lastDirectory;
   let lastHistory;
+  let waitingForHistory;
 
   function remember(table, key, value) {
     table.delete(key);
@@ -179,7 +181,11 @@ function createDotAdapter({ backend, PluginAdapterError, ledger, settings = {} }
     return backend.snapshot(scope, options).then((state) => {
       if (options?.statusOnly) return state;
       observe(state);
-      if (historyReady(state)) lastHistory = state;
+      if (historyReady(state)) {
+        lastHistory = state;
+        waitingForHistory?.abort();
+        waitingForHistory = undefined;
+      }
       lastDirectory = { scope: scopeKey(state), targetID: state.targetID, session: mainSessionHint(state) };
       return state;
     });
@@ -492,23 +498,35 @@ function createDotAdapter({ backend, PluginAdapterError, ledger, settings = {} }
       let state;
       let target = scope;
       let fromCache = false;
+      const key = scopeKey(scope);
       // Panel may subscribe or reconnect while Codex owns the common window.
       // Let explicit selection change the surface and keep history reads passive.
-      for (let attempt = 0; !stop.aborted && attempt < HISTORY_READY_ATTEMPTS; attempt++) {
+      for (let attempt = 1; !stop.aborted; attempt++) {
         state = await snapshot(target).catch(() => null);
         if (state) target = { ...scope, targetID: state.targetID };
         if (historyReady(state)) break;
-        const cached = lastHistory;
-        if (!state && cached && scopeKey(cached) === scopeKey(scope)) {
+        const waiting = attempt >= HISTORY_READY_ATTEMPTS;
+        if (lastHistory || request.live && (attempt === 1 || waiting)) {
           const binding = await backend.sharedBinding?.();
-          if (binding && binding.targetID === cached.targetID && scopeKey(binding) === scopeKey(scope) &&
-              (!target.targetID || target.targetID === binding.targetID)) {
-            state = cached;
-            target = { ...scope, targetID: state.targetID };
-            fromCache = true;
-            break;
+          if (binding?.targetID && scopeKey(binding) === key && (!target.targetID || binding.targetID === target.targetID)) {
+            target = { ...scope, targetID: binding.targetID };
+            const cached = lastHistory;
+            if (cached?.targetID === target.targetID && scopeKey(cached) === key) {
+              state = cached;
+              fromCache = true;
+              break;
+            }
+            if (request.live && waiting && !state?.history.failed) {
+              // Selection or a watcher can supply the first transcript. If neither
+              // runs, periodically check that the same binding still exists.
+              waitingForHistory ??= new AbortController();
+              const wake = AbortSignal.any([stop, waitingForHistory.signal]);
+              await delay(HISTORY_RECHECK_MS, undefined, { signal: wake }).catch(() => {});
+              continue;
+            }
           }
         }
+        if (waiting) break;
         await delay(Math.min(pollMs, 250), undefined, { signal: stop }).catch(() => {});
       }
       if (stop.aborted) return;

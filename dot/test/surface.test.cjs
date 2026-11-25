@@ -182,6 +182,8 @@ test("native Dot composer identifies the room when its transcript has no scrolle
   const state = f.call("inspect", expected);
   assert.equal(state.roomID, "room-1");
   assert.equal(state.history.loaded, true);
+  f.owner.memoizedProps.thread.loaded = false;
+  assert.equal(f.call("inspect", expected).history.loaded, false);
   assert.equal(f.call("fill", expected, { text: "hello" }).previousDraft, "");
   assert.equal(f.call("send", expected, { text: "hello" }), true);
   assert.equal(f.clicked(), 1);

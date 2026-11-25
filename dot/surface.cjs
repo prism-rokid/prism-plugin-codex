@@ -290,11 +290,12 @@ function dotSurface(command, expected = {}, input = {}) {
   }
 
   const hasNativeCursor = Boolean(scroller && thread && own(thread, "cursors"));
+  const loaded = own(thread, "loaded");
   const anchor = scroller && rows.find((row) => row.getBoundingClientRect().bottom > scroller.getBoundingClientRect().top);
   return {
     ...identity, approvalPending, messages,
     handoff: { requestID: str(own(handoff, "requestId")), messageID: str(own(handoff, "messageId")), final: own(handoff, "hideIndicator") === true },
-    history: { loaded: hasNativeCursor ? own(thread, "loaded") === true : Boolean(list),
+    history: { loaded: hasNativeCursor ? loaded === true : Boolean(list) && loaded !== false,
       hasBefore: hasNativeCursor ? Boolean(own(own(thread, "cursors"), "before")) : null,
       loading: own(thread, "olderLoading") === true, failed: Boolean(own(thread, "error")),
       scrollTop: scroller?.scrollTop || 0, anchorID: str(anchor?.getAttribute("data-message-id")),

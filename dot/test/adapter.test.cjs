@@ -186,6 +186,7 @@ test("history is newest first, paginates only when necessary, and keeps linked r
 test("reopening Dot history keeps Codex foreground and only serves the verified binding's cached turns", async () => {
   const initial = state({ history: { loaded: true, hasBefore: true } });
   let dotForeground = true;
+  let loading = false;
   let targetID = initial.targetID;
   let historyLoads = 0;
   const f = fixture(initial, {
@@ -193,6 +194,7 @@ test("reopening Dot history keeps Codex foreground and only serves the verified 
     async snapshot(_expected, options = {}) {
       assert.notEqual(options.activate, true);
       if (!dotForeground) throw new Error("Codex foreground");
+      if (loading) return state({ messages: [], history: { loaded: false } });
       return initial;
     },
     async loadHistory() {
@@ -209,9 +211,65 @@ test("reopening Dot history keeps Codex foreground and only serves the verified 
   assert.equal(historyLoads, 1);
   assert.equal(dotForeground, false);
 
+  dotForeground = true;
+  loading = true;
+  assert.deepEqual(await yieldAll(f.adapter.readHistoryStream(f.session, { limit: 2 })), initialPage);
+  dotForeground = false;
   targetID = "replaced-target";
   await assert.rejects(yieldAll(f.adapter.readHistoryStream(f.session, { limit: 2 })), { code: "dot_history_unavailable" });
   f.adapter.close();
+});
+
+test("a cold live history stream waits for selection on its original shared window", async (t) => {
+  for (const outcome of ["selected", "cancelled", "adapter closed", "target replaced", "unbound"]) {
+    await t.test(outcome, { timeout: 2000 }, async (t) => {
+      const bound = state();
+      const waiting = Promise.withResolvers();
+      let targetID = bound.targetID;
+      let bindingChecks = 0;
+      let foreground = false;
+      let passiveReads = 0;
+      const f = fixture(bound, {
+        async sharedBinding() {
+          if (++bindingChecks === 2) waiting.resolve();
+          return outcome === "unbound" ? null : { ...bound, targetID };
+        },
+        async snapshot(expected, { activate = false } = {}) {
+          if (activate) foreground = true;
+          else passiveReads++;
+          if (!foreground || expected.targetID && expected.targetID !== targetID) throw Error("window unavailable");
+          return { ...bound, targetID };
+        },
+      });
+      t.after(() => f.adapter.close());
+      const controller = new AbortController();
+      const stream = f.adapter.readHistoryStream(f.session, { limit: 1, live: true }, controller.signal);
+      const first = stream.next();
+      if (outcome === "unbound") {
+        await assert.rejects(first, { code: "dot_history_unavailable" });
+        return;
+      }
+      await waiting.promise;
+      const readsAtWait = passiveReads;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(passiveReads, readsAtWait);
+      if (outcome === "cancelled") controller.abort();
+      if (outcome === "adapter closed") f.adapter.close();
+      if (outcome === "cancelled" || outcome === "adapter closed") {
+        assert.equal((await first).done, true);
+        return;
+      }
+      if (outcome === "target replaced") targetID = "replacement";
+      await f.adapter.controlSession({ action: "conversation.select", session: f.session });
+      if (outcome === "target replaced") {
+        await assert.rejects(first, { code: "dot_history_unavailable" });
+        return;
+      }
+      assert.equal((await first).value.turn.turn_id, "baseline");
+      assert.equal((await stream.next()).value.type, "page_end");
+      await stream.return();
+    });
+  }
 });
 
 test("wire dates are safe for Hub and detail timestamps use milliseconds", async () => {
