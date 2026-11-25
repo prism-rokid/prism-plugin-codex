@@ -339,13 +339,14 @@ function createDotAdapter({ backend, PluginAdapterError, ledger, settings = {} }
 
     async probe() {
       const available = await runtimeAvailable();
+      const bound = available || Boolean(await backend.savedSession?.());
       return {
         PluginID: "dot", Available: available, IntegrationMode: "desktop-automation", VisibilitySurface: "chatgpt-dot-desktop",
         NativeVisibleInput: available, NativeVisibleOutput: available,
-        CanAttachSession: available, CanStartSessionWithMessage: false, CanOpenDraft: false,
-        CanListSessions: available, CanReadHistory: available, CanForwardSync: available,
-        CanReverseSync: available, CanPluginWideWatch: true, CanWaitRun: available, CanReadStatus: available,
-        CanInterrupt: false, CanApproval: false, CanControlSession: available,
+        CanAttachSession: bound, CanStartSessionWithMessage: false, CanOpenDraft: false,
+        CanListSessions: bound, CanReadHistory: bound, CanForwardSync: bound,
+        CanReverseSync: bound, CanPluginWideWatch: true, CanWaitRun: bound, CanReadStatus: bound,
+        CanInterrupt: false, CanApproval: false, CanControlSession: bound,
         UnavailableReason: available ? "" : "The managed Dot window is unavailable.",
       };
     },
@@ -361,9 +362,13 @@ function createDotAdapter({ backend, PluginAdapterError, ledger, settings = {} }
         return [mainSessionHint(await snapshot())];
       } catch (error) {
         const binding = await backend.sharedBinding?.();
-        if (!binding?.dotID || !binding.roomID || typeof binding.workspace !== "string") throw error;
-        if (lastDirectory?.scope === scopeKey(binding) && lastDirectory.targetID === binding.targetID) return [lastDirectory.session];
-        return [mainSessionHint(binding)];
+        if (binding?.dotID && binding.roomID && typeof binding.workspace === "string") {
+          if (lastDirectory?.scope === scopeKey(binding) && lastDirectory.targetID === binding.targetID) return [lastDirectory.session];
+          return [mainSessionHint(binding)];
+        }
+        const saved = await backend.savedSession?.();
+        if (!saved) throw error;
+        return [{ ...mainSessionHint(saved), Metadata: { ...MAIN_SESSION_METADATA, can_send: "false" } }];
       }
     },
 

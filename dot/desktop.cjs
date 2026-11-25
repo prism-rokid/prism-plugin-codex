@@ -173,6 +173,19 @@ function createDesktopBackend({ CdpPageClient, PluginAdapterError, readDotWindow
       }
     },
 
+    async savedSession() {
+      // Hub persists the opaque binding only after the native Dot has verified it.
+      // Its identity survives a host restart, but its old renderer cannot be used.
+      const lease = await readDotWindowLease({ requireLive: false });
+      if (lease?.shared_window !== true || lease.phase !== "ready" || typeof lease.binding !== "string") return null;
+      try {
+        const { dot_id, room_id, workspace } = boundIdentity(lease.binding);
+        return { dotID: dot_id, roomID: room_id, workspace };
+      } catch {
+        return null;
+      }
+    },
+
     async snapshot(expected = {}, { activate = false, statusOnly = false } = {}) {
       const read = (lease) => withPage(({ state }) => state, expected, { activate, statusOnly, lease });
       if (activate) {

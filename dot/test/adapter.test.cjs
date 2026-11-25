@@ -437,6 +437,42 @@ test("a restarted adapter lists one pinned main session from the verified bindin
   assert.equal(main.Active, false);
 });
 
+test("a stale ready lease preserves only the pinned directory and remote contract after restart", async () => {
+  const id = nativeSession(state({ roomID: "room:1" })).NativeSessionID;
+  const ready = { phase: "ready", shared_window: true, binding: id };
+  let saved = ready;
+  const backend = createDesktopBackend({ PluginAdapterError, withDesktopHostLock: (operation) => operation(),
+    readDotWindowLease: ({ requireLive = true } = {}) => requireLive ? null : saved });
+  const adapter = createDotAdapter({ backend, PluginAdapterError, settings: { pollMs: 1 } });
+  const capabilities = await adapter.probe();
+  assert.equal(capabilities.Available, false);
+  assert.equal(capabilities.NativeVisibleInput, false);
+  assert.equal(capabilities.NativeVisibleOutput, false);
+  assert.equal((await adapter.discover()).Verified, false);
+  for (const name of ["CanAttachSession", "CanListSessions", "CanReadHistory", "CanForwardSync", "CanWaitRun"]) {
+    assert.equal(capabilities[name], true, name);
+  }
+  const sessions = await adapter.listSessions();
+  assert.equal(sessions.length, 1);
+  const [main] = sessions;
+  assert.equal(main.NativeSessionID, id);
+  assert.equal(main.NativeThreadID, id);
+  assert.equal(main.Active, false);
+  assert.equal(main.Metadata.pinned, "true");
+  assert.equal(main.Metadata.can_send, "false");
+  assert.equal((await adapter.readStatus(main)).available, false);
+  await assert.rejects(yieldAll(adapter.readHistoryStream(main, { limit: 1 })), { code: "dot_history_unavailable" });
+  await assert.rejects(adapter.attachSession(main), { code: "dot_window_unavailable" });
+  await assert.rejects(adapter.send(main, { Text: "unavailable", PrismMessageID: "new" }), { code: "dot_window_unavailable" });
+
+  for (saved of [null, { ...ready, phase: "opening" }, { ...ready, shared_window: false }, { ...ready, binding: "dot:x::" }]) {
+    const unbound = await adapter.probe();
+    assert.equal(unbound.CanListSessions, false);
+    assert.equal(unbound.CanForwardSync, false);
+    await assert.rejects(adapter.listSessions(), { code: "dot_window_unavailable" });
+  }
+});
+
 test("published SDK transport sends typed indeterminate errors and compatible v4 fields", async () => {
   const input = new PassThrough();
   const destination = new PassThrough();
