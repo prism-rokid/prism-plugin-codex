@@ -77,7 +77,7 @@ test("an idle Dot transcript permits a follow-up before an unlinked run times ou
   f.set(state({ targetID: "target-2", messages: [...messages, answer] }));
   await assert.rejects(sendAgain(), { code: "dot_busy" });
   f.set(state({ messages: [...messages, answer], approvalPending: true }));
-  await assert.rejects(sendAgain(), { code: "dot_busy" });
+  await assert.rejects(sendAgain(), { code: "dot_approval_pending" });
   assert.equal(f.clicks(), 1);
 
   f.set(state({ messages: [...messages, answer] }));
@@ -89,6 +89,27 @@ test("an idle Dot transcript permits a follow-up before an unlinked run times ou
   const completion = await f.adapter.waitForRun(f.session, receipt.NativeMessageID);
   assert.equal(completion.Type, "run.wait_timeout");
   assert.equal(completion.Payload.timeout_fallback, true);
+});
+
+test("an unlinked receipt cannot keep an idle native composer busy indefinitely", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const f = fixture();
+  const first = await f.adapter.send(f.session, { PrismMessageID: "first", Text: "hello" });
+  const followUp = () => f.adapter.send(f.session, { PrismMessageID: "second", Text: "follow-up" });
+  await assert.rejects(followUp(), { code: "dot_busy" });
+  t.mock.timers.tick(9000);
+  // Virtualization may remove the user row needed to associate an unlinked reply.
+  const visible = [reply("visible", "A reply with no native request ID")];
+  f.set(state({ messages: visible, approvalPending: true }));
+  assert.equal((await f.adapter.readStatus(f.session)).approval_blocked, true);
+  await assert.rejects(followUp(), { code: "dot_approval_pending" });
+  f.set(state({ messages: visible, typing: true }));
+  await assert.rejects(followUp(), { code: "dot_busy" });
+  f.set(state({ messages: visible }));
+  assert.equal((await f.adapter.readStatus(f.session)).status, "idle");
+  assert.equal((await f.adapter.readStatus(f.session, first.NativeMessageID)).status, "unknown");
+  assert.equal((await followUp()).NativeMessageID, "user-2");
+  assert.equal(f.clicks(), 2);
 });
 
 test("Dot links a handoff by native request ID while preserving the message receipt ID", async () => {

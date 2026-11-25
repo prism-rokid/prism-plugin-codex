@@ -5,6 +5,8 @@ const { createHash } = require("node:crypto");
 
 const MAX_HISTORY = 20;
 const HISTORY_READY_ATTEMPTS = 16;
+// Cover the gap between a native receipt and the first typing indication.
+const REPLY_START_GRACE_MS = 8000;
 const HISTORY_FAILURE = "The native Dot history could not be read for the bound conversation.";
 const DELIVERY_UNCONFIRMED = "Dot delivery is unconfirmed. Check the native conversation before sending again.";
 const MAIN_SESSION_TITLE = "Dot 主会话";
@@ -57,7 +59,7 @@ function messageEntry(row) {
   };
 }
 
-function historyTurns(rows, run) {
+function historyTurns(rows, run, typing = false) {
   const turns = new Map();
   let current = null;
   for (const row of rows) {
@@ -70,7 +72,7 @@ function historyTurns(rows, run) {
       if (turn) turn.messages.push(messageEntry(row));
     }
   }
-  if (run?.runID && turns.has(run.runID) && run.observedProgress && !run.timedOut && (!run.followUpReady || run.final)) {
+  if (run?.observedProgress && turns.has(run.runID) && !run.timedOut && (run.final || typing || awaitingReplyStart(run))) {
     const turn = turns.get(run.runID);
     const final = run.final;
     const status = final ? "completed" : "running";
@@ -111,6 +113,10 @@ function acceptedRow(state, initial, text, submittedAt) {
 
 function matchesHandoff(run, handoff) {
   return Boolean(handoff?.requestID && (handoff.requestID === run.runID || handoff.requestID === run.requestID));
+}
+
+function awaitingReplyStart(run) {
+  return Boolean(run && !run.final && !run.timedOut && !run.followUpReady && Date.now() < run.replyStartDeadline);
 }
 
 function linkedReply(run, state) {
@@ -206,11 +212,13 @@ function createDotAdapter({ backend, PluginAdapterError, ledger, settings = {} }
     return [...runs.values()].reverse().find((run) => run.scopeKey === scopeKey(state) && run.targetID === state.targetID);
   }
 
-  function runStatus(state, run = lastRun(state)) {
-    return { status: run?.final ? "completed" : state.typing ? "running" : run ? "unknown" : "idle",
-      available: true, active: Boolean(!run?.final && state.typing),
-      phase: run && !run.final && (!state.typing || run.timedOut) ? { id: "completion_unconfirmed" } : undefined,
-      interruptible: false, approval_blocked: false, turn_id: run?.runID,
+  function runStatus(state, run = lastRun(state), requestedRun = false) {
+    const active = Boolean(state.typing && (!requestedRun || run && !run.final && run === lastRun(state)));
+    const status = active ? "running" : run?.final ? "completed" :
+      run && (requestedRun || awaitingReplyStart(run)) ? "unknown" : "idle";
+    return { status, available: true, active,
+      phase: status === "unknown" ? { id: "completion_unconfirmed" } : undefined,
+      interruptible: false, approval_blocked: Boolean(state.approvalPending), turn_id: run?.runID,
       started_at: wireDate(run?.startedAt), completed_at: wireDate(run?.final?.createdAt) };
   }
 
@@ -394,7 +402,7 @@ function createDotAdapter({ backend, PluginAdapterError, ledger, settings = {} }
       const existing = requests.get(requestKey);
       if (existing?.receipt) return existing.receipt;
       if (existing) throw failure("delivery_indeterminate", DELIVERY_UNCONFIRMED);
-      if (sending.has(key)) throw failure("dot_busy", "A Prism message is already awaiting a Dot reply.");
+      if (sending.has(key)) throw failure("dot_busy", "Dot is still accepting another Prism message.");
       sending.add(key);
       let initial;
       let submittedAt;
@@ -409,9 +417,10 @@ function createDotAdapter({ backend, PluginAdapterError, ledger, settings = {} }
             remember(requests, requestKey, { submitted: true });
           }, (state) => {
             observe(state);
-            const pendingReply = [...runs.values()].some((run) => run.scopeKey === key && !run.final && !run.timedOut && !run.followUpReady);
-            if (pendingReply || state.approvalPending) {
-              throw failure("dot_busy", "A Prism message is already awaiting a Dot reply or the native Dot conversation is busy.");
+            if (state.approvalPending) throw failure("dot_approval_pending", "An approval is pending in the native Dot conversation.");
+            if (state.typing) throw failure("dot_busy", "Dot is still replying in the native conversation.");
+            if ([...runs.values()].some((run) => run.scopeKey === key && awaitingReplyStart(run))) {
+              throw failure("dot_busy", "Dot just accepted the previous message. Please retry in a moment.");
             }
           });
         } catch (error) {
@@ -428,7 +437,7 @@ function createDotAdapter({ backend, PluginAdapterError, ledger, settings = {} }
             if (ledger && !ledger.confirm(key, requestID, row.id)) break;
             const receipt = { NativeMessageID: row.id, Accepted: true, Visible: true, Detail: "Confirmed the native Dot message." };
             const run = { runID: row.id, requestID: row.requestID, scopeKey: key, targetID: state.targetID, startedAt: wireDate(row.createdAt) || new Date().toISOString(),
-              previousIDs: new Set(initial.messages.map((item) => item.id)), observedProgress: false };
+              previousIDs: new Set(initial.messages.map((item) => item.id)), replyStartDeadline: submittedAt + REPLY_START_GRACE_MS, observedProgress: false };
             remember(runs, `${key}:${run.runID}`, run);
             observe(state);
             remember(requests, requestKey, { receipt });
@@ -468,7 +477,7 @@ function createDotAdapter({ backend, PluginAdapterError, ledger, settings = {} }
       const scope = scopeFor(session, failure);
       const state = await snapshot(scope).catch(() => null);
       if (!state) return { status: "unavailable", available: false, active: false, interruptible: false, approval_blocked: false };
-      return runID ? runStatus(state, runs.get(`${scopeKey(scope)}:${runID}`) || null) : runStatus(state);
+      return runID ? runStatus(state, runs.get(`${scopeKey(scope)}:${runID}`) || null, true) : runStatus(state);
     },
 
     async *readHistoryStream(session, request, signal) {
@@ -507,7 +516,7 @@ function createDotAdapter({ backend, PluginAdapterError, ledger, settings = {} }
       if (!fromCache) lastHistory = state;
       const revisions = new Map();
       function changes(current, source) {
-        const visible = historyTurns(current.messages, lastRun(current)).slice(-limit);
+        const visible = historyTurns(current.messages, lastRun(current), current.typing).slice(-limit);
         if (source === "initial") visible.reverse();
         return visible.flatMap((turn) => {
           const previous = revisions.get(turn.turn_id);
