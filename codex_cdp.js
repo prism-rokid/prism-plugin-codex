@@ -564,7 +564,19 @@ function composerPrimaryActionFactsSource() {
             && typeof props.submitDisabled === 'boolean') legacyOwners.push(props);
         }
         if (!button) return null;
-        if (view) return modernAction(button, view, owner);
+        if (view) {
+          if (owner) return modernAction(button, view, owner);
+          // 部分桌面 Composer 直接渲染 key=send、type=submit 的原生主按钮，
+          // 该路径没有旧版 handleSubmit owner。发送、停止和听写仍按各自的标记区分。
+          if (view.primaryAction?.key !== 'send' || button.type !== 'submit'
+            || element.getAttribute('type') !== 'submit' || typeof view.inputInert !== 'boolean') return null;
+          return {
+            mode: 'submit',
+            submission_kind: 'send',
+            submit_disabled: button.disabled || button.isLoading,
+            interaction_blocked: view.inputInert || view.isInteractionBlocked === true,
+          };
+        }
         if (legacyOwners.length === 0 && turnOwners.length === 1) {
           const owner = turnOwners[0];
           return {
@@ -620,7 +632,11 @@ function composerPrimaryActionFactsSource() {
         else if (state) actionCandidates.push({ element, state });
       }
       if (!actionCandidates.length && otherAction) return { ...otherAction, usable: true, enabled: enabled(otherAction.element) };
-      if (actionCandidates.length !== 1) return { usable: false, reason: 'composer_action_owner_ambiguous', recognized: actionCandidates.length };
+      if (actionCandidates.length !== 1) return {
+        usable: false,
+        reason: 'composer_action_owner_ambiguous',
+        action_candidate_count: actionCandidates.length,
+      };
       const { element, state } = actionCandidates[0];
       return {
         ...state,
@@ -2504,7 +2520,7 @@ class CodexDesktopController extends CdpPageClient {
     // timeout actionable while keeping user text out of Hub/API diagnostics.
     const diagnostic = lastFacts ? {
       reason: String(lastFacts.reason || ""),
-      recognized: lastFacts.recognized,
+      action_candidate_count: lastFacts.action_candidate_count,
       usable: lastFacts.usable === true,
       enabled: lastFacts.enabled === true,
       mode: String(lastFacts.mode || ""),
