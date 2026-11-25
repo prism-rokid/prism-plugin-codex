@@ -24,9 +24,7 @@ const assets = await Promise.all(platforms.map(async (platform) => {
   const bytes = await readFile(resolve(artifacts, filename));
   if (!bytes.length) throw new Error(`empty platform archive: ${filename}`);
   const sha256 = createHash("sha256").update(bytes).digest("hex");
-  return plugin === "dot"
-    ? { platform, filename, sha256, size_bytes: bytes.length }
-    : { target: platform, filename, sha256, supported: true };
+  return { platform, filename, sha256, size_bytes: bytes.length };
 }));
 const metadata = {
   schema_version: 1,
@@ -36,7 +34,6 @@ const metadata = {
   description,
   icon_url: iconURL,
   icon_svg_url: iconSVGURL,
-  ...(plugin === "codex" ? { release_tag: `v${version}` } : {}),
   channel: "stable",
   plugin_protocol_version: protocolVersion,
   min_hub_version: minHubVersion,
