@@ -60,10 +60,8 @@ function navigationExpression(identity, steps) {
     const nodes = (selector) => [...document.querySelectorAll(selector)].filter(visible);
     const busy = nodes('[data-codex-approval-surface="true"], [role="alertdialog"], [data-codex-stop-button], .typing-indicator[data-visible="true"]');
     if (busy.length) return 'desktop_busy';
-    const editors = nodes('[contenteditable="true"], [contenteditable="plaintext-only"], textarea');
-    const hasDraft = editors.some((el) => (el.value ?? el.innerText ?? el.textContent ?? '').trim()) ||
-      nodes('.composer-attachment-surface').length > 0;
-    if (hasDraft) return 'desktop_draft';
+    // A sidebar switch leaves text drafts to the native conversation.
+    if (nodes('.composer-attachment-surface').length) return 'desktop_attachments';
     const openSidebar = () => {
       const triggers = nodes('[data-app-shell-sidebar-trigger][aria-expanded="false"]')
         .filter((el) => !el.disabled && el.getAttribute('aria-disabled') !== 'true');

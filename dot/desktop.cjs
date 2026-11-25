@@ -117,7 +117,7 @@ function createDesktopBackend({ CdpPageClient, PluginAdapterError, readDotWindow
       }
       if (!state?.roomID || !state?.dotID || (lease.workspace !== undefined && state.workspace !== lease.workspace)) {
         if (activation === "desktop_busy") throw fail("dot_window_busy", "The shared ChatGPT window is handling a desktop action.");
-        if (activation === "desktop_draft") throw fail("dot_window_busy", "The shared ChatGPT window has an unsent draft.");
+        if (activation === "desktop_attachments") throw fail("dot_window_busy", "The shared ChatGPT window has a pending attachment.");
         const proof = activate ? await pageCall("bind_status", {}).catch(() => null) : null;
         const identityStage = proof?.stage || (proof?.dotID && (proof.dotID !== scope.dotID
           ? "different_dot" : proof.roomID !== scope.roomID ? "different_room" :

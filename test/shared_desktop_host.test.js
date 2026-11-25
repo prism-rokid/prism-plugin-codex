@@ -50,21 +50,21 @@ test("shared navigation resolves Codex rows by native identity", () => {
     { result: "codex_thread_ambiguous", clicked: [] });
 });
 
-test("shared navigation protects visible drafts and ignores hidden editors", () => {
-  const plaintext = { '[contenteditable="plaintext-only"]': { innerText: "Unsent Dot message" } };
-  for (const agent of ["codex", "dot"]) {
-    assert.deepEqual(runSharedWindowSwitch(agent, plaintext), { result: "desktop_draft", clicked: [] });
-  }
-  assert.deepEqual(runSharedWindowSwitch("dot", { ".composer-attachment-surface": {} }),
-    { result: "desktop_draft", clicked: [] });
-
+test("text drafts allow sidebar navigation while attachments and active actions block switching", () => {
   const drafts = {
-    '[contenteditable="plaintext-only"]': { innerText: "  " },
-    '[contenteditable="true"]': { innerText: "Hidden draft", getClientRects: () => [] },
+    '[contenteditable="plaintext-only"]': { innerText: "Unsent Dot message" },
+    '[contenteditable="true"]': { innerText: "Unsent Codex message" },
+    textarea: { value: "Unrelated text" },
     ".composer-attachment-surface": { getClientRects: () => [] },
   };
   assert.deepEqual(runSharedWindowSwitch("codex", drafts), { result: "codex-thread", clicked: ["codex"] });
   assert.deepEqual(runSharedWindowSwitch("dot", drafts), { result: "dot_entry_clicked", clicked: ["dot"] });
+  for (const agent of ["codex", "dot"]) {
+    assert.deepEqual(runSharedWindowSwitch(agent, { ...drafts, ".composer-attachment-surface": {} }),
+      { result: "desktop_attachments", clicked: [] });
+    assert.deepEqual(runSharedWindowSwitch(agent, { ...drafts, "[data-codex-stop-button]": {} }),
+      { result: "desktop_busy", clicked: [] });
+  }
 });
 
 test("desktop host lock is shared across plugin processes and releases on exit", async (t) => {

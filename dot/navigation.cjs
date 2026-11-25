@@ -1,6 +1,5 @@
 "use strict";
 
-// The shared navigation guard checks for drafts and active native actions first.
 function dotNavigation(identity, navigationExpression) {
   return navigationExpression(identity, `
     const threadMarkers = [...document.querySelectorAll('[data-above-composer-conversation-id]')].filter((el) => visible(el.parentElement));

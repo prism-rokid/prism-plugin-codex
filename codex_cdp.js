@@ -44,7 +44,7 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 15000;
 const DEFAULT_READY_TIMEOUT_MS = 15000;
 const THREAD_SELECTION_TIMEOUT_MS = process.platform === "win32" ? 9000 : 4000;
 const SHARED_SWITCH_FAILURES = new Set([
-  "desktop_busy", "desktop_draft", "sidebar_opening", "codex_thread_not_visible",
+  "desktop_busy", "desktop_attachments", "sidebar_opening", "codex_thread_not_visible",
   "codex_thread_ambiguous", "codex_thread_disabled", "codex_previous_thread_unavailable",
 ]);
 
@@ -2192,7 +2192,7 @@ class CodexDesktopController extends CdpPageClient {
       const switchFailure = SHARED_SWITCH_FAILURES.has(previous) ? previous : "";
       if (!previous || switchFailure) {
         await this.close();
-        if (previous === "desktop_draft") throw new Error("The shared ChatGPT window has an unsent draft");
+        if (previous === "desktop_attachments") throw new Error("The shared ChatGPT window has a pending attachment");
         if (previous === "desktop_busy") throw new Error("The shared ChatGPT window is handling a desktop action");
         const error = new Error(`Codex desktop surface is unavailable while another agent is in the foreground${switchFailure ? ` (${switchFailure})` : ""}`);
         if (sharedTarget && otherForeground && !canSwitch) {
@@ -2239,7 +2239,7 @@ class CodexDesktopController extends CdpPageClient {
     // Older rows sometimes only mount after returning to the Codex surface.
     // Callers still select and verify the requested thread before using it.
     const previous = await navigate("");
-    if (previous === "desktop_busy" || previous === "desktop_draft") return previous;
+    if (previous === "desktop_busy" || previous === "desktop_attachments") return previous;
     return previous && !SHARED_SWITCH_FAILURES.has(previous) ? previous : result;
   }
 
