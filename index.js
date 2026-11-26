@@ -9,7 +9,7 @@ const path = require("path");
 const { execFile, spawn } = require("child_process");
 const { promisify } = require("util");
 const crypto = require("crypto");
-const { createCodexDesktopController, normalizeCwdForMatch, probeCodexMainPage, windowsCodexAppPath } = require("./codex_cdp");
+const { createCodexDesktopController, normalizeCwdForMatch, diagnoseCodexMainPage, windowsCodexAppPath } = require("./codex_cdp");
 
 const execFileAsync = promisify(execFile);
 const CODEX_ROOT = process.platform === "win32"
@@ -5914,6 +5914,28 @@ async function describeCodexControls(threadID = "", options = {}) {
 
 }
 
+function codexDiagnostic(installed, stateAvailable, cdp) {
+  const Component = "Codex Desktop";
+  const Facts = { state_available: stateAvailable, transport: "cdp", ...(cdp ? { transport_reachable: cdp.reachable } : {}) };
+  if (!installed) return {
+    State: "not_installed", Code: "app_not_installed", Summary: "未找到 Codex 桌面应用",
+    Component, Actions: ["open_download", "locate_agent", "recheck"], Facts,
+  };
+  if (!stateAvailable) return {
+    State: "unavailable", Code: "state_unavailable", Summary: "Codex 会话数据不可用",
+    Detail: "找不到会话索引或无法读取会话数据库。", Component, Actions: ["recheck"], Facts,
+  };
+  if (cdp.page) return { State: "ready", Code: "ready", Summary: "Codex 已连接", Component, Facts };
+  if (cdp.reachable) return {
+    State: "unavailable", Code: "cdp_page_unavailable", Summary: "Codex 控制页面不可用",
+    Detail: "CDP 已响应，但尚未找到 Codex 工作区页面。", Component, Actions: ["managed_relaunch", "recheck"], Facts,
+  };
+  return {
+    State: "unavailable", Code: "control_channel_unreachable", Summary: "Codex CDP 未连通",
+    Component, Actions: ["managed_relaunch", "recheck"], Facts,
+  };
+}
+
 async function capability() {
   const installed = codexInstalled();
   const database = stateDBPath();
@@ -5934,7 +5956,8 @@ async function capability() {
   const localStateAvailable = installed && (Boolean(database) || sessionIndexExists) && !stateReason;
   // Probe only the native CDP surface. Waiting for a visible workspace here
   // would block the 15s reverse-sync reconciliation that owns the watcher.
-  const desktopControlAvailable = localStateAvailable && await probeCodexMainPage();
+  const cdp = localStateAvailable ? await diagnoseCodexMainPage() : null;
+  const desktopControlAvailable = cdp?.page === true;
   const unavailableReason = stateReason || (!localStateAvailable
     ? process.platform === "win32" ? "找不到 Codex 桌面应用或会话数据；请检查应用路径和 CODEX_HOME。" : "codex_desktop_or_state_db_unavailable"
     : desktopControlAvailable ? "" : process.platform === "win32" ? "无法连接 Codex Desktop；请启动桌面应用并检查 CDP 配置。" : "codex_desktop_control_unavailable");
@@ -5960,6 +5983,7 @@ async function capability() {
     IntegrationMode: "desktop-automation",
     VisibilitySurface: "codex-desktop",
     UnavailableReason: available ? "" : unavailableReason,
+    Diagnostics: codexDiagnostic(installed, localStateAvailable, cdp),
   };
 }
 

@@ -1801,6 +1801,10 @@ function selectCodexMainPageTarget(targets) {
 // so a single miss during Hub startup must not downgrade the registered remote
 // capability for the entire Hub lifetime.
 async function probeCodexMainPage(options = {}) {
+  return (await diagnoseCodexMainPage(options)).page;
+}
+
+async function diagnoseCodexMainPage(options = {}) {
   const overrideUrl = firstNonEmpty(process.env.PRISM_CODEX_CDP_URL, options.cdpUrl);
   const overridePort = firstNonEmpty(process.env.PRISM_CODEX_CDP_PORT, options.cdpPort ? String(options.cdpPort) : "");
   let listURLs = [];
@@ -1828,17 +1832,26 @@ async function probeCodexMainPage(options = {}) {
     listURLs.push(...await managedCdpListURLs(userDataDir));
   }
   listURLs = [...new Set(listURLs)];
-  if (!listURLs.length) return false;
+  let reachable = false;
+  if (!listURLs.length) return { page: false, reachable };
   const attempts = Math.max(1, Math.min(3, Number(options.attempts) || 3));
   const retryDelayMs = Math.max(0, Math.min(1_000, Number(options.retryDelayMs) || 300));
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     for (const listURL of listURLs) {
       try {
-        const response = await fetch(listURL, {
-          cache: "no-store",
-          signal: AbortSignal.timeout(2000),
-        });
-        if (response.ok && selectCodexMainPageTarget(await response.json())) return true;
+        const requestOptions = { cache: "no-store", signal: AbortSignal.timeout(2000) };
+        const response = await fetch(listURL, requestOptions);
+        if (!response.ok) continue;
+        const targets = await response.json();
+        if (selectCodexMainPageTarget(targets)) return { page: true, reachable: true };
+        if (reachable || !Array.isArray(targets)) continue;
+        // 空列表也可能来自普通 HTTP 服务，检查 CDP 版本响应再确认可达。
+        const version = await fetch(new URL("version", listURL).href, requestOptions);
+        if (!version.ok) continue;
+        const protocol = await version.json();
+        reachable = typeof protocol?.Browser === "string" &&
+          /^\d+\.\d+$/.test(protocol["Protocol-Version"] || "") &&
+          /^wss?:\/\//i.test(protocol.webSocketDebuggerUrl || "");
       } catch {
         // The next bounded attempt handles the normal DevToolsActivePort → page
         // target publication race. A final failure remains fail-closed.
@@ -1848,7 +1861,7 @@ async function probeCodexMainPage(options = {}) {
       await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
     }
   }
-  return false;
+  return { page: false, reachable };
 }
 
 function singletonArtifacts(userDataDir = "") {
@@ -4487,6 +4500,7 @@ module.exports = {
   isCodexMainPageTarget,
   normalizeCwdForMatch,
   probeCodexMainPage,
+  diagnoseCodexMainPage,
   selectCodexMainPageTarget,
   __test: {
     goalPlanDOMHelpersSource,

@@ -837,3 +837,31 @@ test("model discovery refuses two distinct visible owners", async () => {
   const controls = await controller.closedComposerControls();
   assert.equal(controls.intelligence, null);
 });
+
+test("Codex CDP 诊断区分端口不可达和工作区页面缺失", async () => {
+  const { diagnoseCodexMainPage } = require("../codex_cdp");
+  const originalFetch = global.fetch;
+  const options = { cdpUrl: "http://127.0.0.1:19999", attempts: 1 };
+  try {
+    global.fetch = async () => { throw new Error("连接被拒绝"); };
+    assert.deepEqual(await diagnoseCodexMainPage(options), { page: false, reachable: false });
+    global.fetch = async url => ({
+      ok: true,
+      json: async () => url.endsWith("/json/list") ? [{ unrelated: true }] : {},
+    });
+    assert.deepEqual(await diagnoseCodexMainPage(options), { page: false, reachable: false });
+    global.fetch = async url => ({
+      ok: true,
+      json: async () => url.endsWith("/json/list") ? [] : {
+        Browser: "Electron", "Protocol-Version": "1.3", webSocketDebuggerUrl: "ws://127.0.0.1/browser",
+      },
+    });
+    assert.deepEqual(await diagnoseCodexMainPage(options), { page: false, reachable: true });
+    global.fetch = async () => ({
+      ok: true, json: async () => [{ type: "page", url: "app://-/index.html", webSocketDebuggerUrl: "ws://127.0.0.1/page" }],
+    });
+    assert.deepEqual(await diagnoseCodexMainPage(options), { page: true, reachable: true });
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
