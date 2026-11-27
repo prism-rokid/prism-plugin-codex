@@ -4275,23 +4275,10 @@ function isReplaceableAnonymousDraft(runtime = {}) {
   if (!runtime || isThreadID(firstNonEmpty(runtime.current_thread_id))) return false;
   return Boolean(
     anonymousDraftFingerprint(runtime)
-    && !String(runtime.composer_text || "").trim()
-    && runtime.composer_available !== false
-    && runtime.running !== true
-    && runtime.waiting_approval !== true
-  );
-}
-
-// A remote draft open must recover from a leftover anonymous draft: an
-// interrupted remote send leaves its text in the composer and would otherwise
-// block every later attempt. Anonymous drafts have no durable thread identity,
-// so a readable, idle, usable composer may discard its text before the fresh
-// draft opens.
-function isDiscardableAnonymousDraft(runtime = {}) {
-  if (!runtime || isThreadID(firstNonEmpty(runtime.current_thread_id))) return false;
-  return Boolean(
-    anonymousDraftFingerprint(runtime)
-    && runtime.composer_available !== false
+    && typeof runtime.composer_text === "string"
+    && !runtime.composer_text.trim()
+    && runtime.composer_has_attachments !== true
+    && runtime.composer_available === true
     && runtime.running !== true
     && runtime.waiting_approval !== true
   );
@@ -4344,8 +4331,8 @@ async function describeCodexDraftControls(controller, expectedFingerprint = "") 
   if (isThreadID(activeThreadID)) {
     throw draftStale("desktop foreground changed to a conversation");
   }
-  if (!runtime || String(runtime.composer_text || "").trim()) {
-    throw draftStale("desktop draft is no longer empty");
+  if (!isReplaceableAnonymousDraft(runtime)) {
+    throw draftStale("desktop draft is no longer empty or readable; existing text and attachments have been preserved");
   }
   const fingerprint = anonymousDraftFingerprint(runtime);
   if (!fingerprint) {
@@ -4383,15 +4370,7 @@ async function openDraft(req) {
   const previous = await currentDesktopRuntimeSnapshot().catch(() => null);
   const previousThreadID = firstNonEmpty(previous && previous.current_thread_id);
   if (!isThreadID(previousThreadID) && !isReplaceableAnonymousDraft(previous)) {
-    // Windows only: a leftover anonymous draft text (usually from an
-    // interrupted remote send) must not block the next remote draft. Other
-    // platforms keep the strict fail-closed contract.
-    if (process.platform !== "win32" || !isDiscardableAnonymousDraft(previous)) {
-      throw new Error("codex cannot replace a non-empty or unreadable anonymous desktop draft");
-    }
-    console.warn("[codex] discarding anonymous desktop draft text before opening a remote draft");
-    await controller.clearComposer().catch(() => {});
-    await sleep(120);
+    throw new Error("native_draft_conflict: Codex Desktop has an unsent or unreadable draft. Existing text and attachments have been preserved; send or save the draft in Codex Desktop, open an empty draft, then retry.");
   }
   await activateNewThread(cwd);
   try {
@@ -7023,7 +7002,7 @@ async function pollDesktopWatch() {
         emitMobileDraftsStale("desktop foreground changed to another anonymous draft", (draft) =>
           !isCurrentAnonymousMobileDraft(draft, runtime),
         );
-        if (String(runtime.composer_text || "").trim()) {
+        if (!isReplaceableAnonymousDraft(runtime)) {
           emitMobileDraftsStale("desktop draft is no longer empty", (draft) =>
             isCurrentAnonymousMobileDraft(draft, runtime),
           );

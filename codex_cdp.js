@@ -355,6 +355,38 @@ function composerContainerElementExpression() {
   })()`;
 }
 
+// Draft emptiness must describe the actual editor, not its surrounding controls.
+// Goal and model controls can render text inside the Composer container.
+function composerDraftContentStateSource() {
+  return `
+    const prismComposerDraftContentState = () => {
+      const container = ${composerContainerElementExpression()};
+      const selector = 'textarea, input:not([type="hidden"]), [contenteditable="true"]';
+      const candidates = container ? [
+        ...(container.matches(selector) ? [container] : []),
+        ...container.querySelectorAll(selector),
+      ].filter((element) => {
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && !element.disabled
+          && element.getAttribute('aria-disabled') !== 'true'
+          && !element.closest('[role="menu"], [role="listbox"]');
+      }) : [];
+      const editor = candidates.length === 1 ? candidates[0] : null;
+      ${composerAttachmentStateSource()}
+      const attachments = prismComposerAttachmentState();
+      const text = !editor ? null
+        : typeof editor.value === 'string' ? editor.value
+        : typeof editor.innerText === 'string' ? editor.innerText
+        : typeof editor.textContent === 'string' ? editor.textContent : null;
+      return {
+        composer_text: text,
+        composer_available: Boolean(editor) && text !== null,
+        composer_has_attachments: attachments.present === true,
+      };
+    };
+  `;
+}
+
 function composerPrimaryActionElementExpression(expectedSubmissionKind) {
   return `(() => {
     ${composerPrimaryActionFactsSource()}
@@ -2761,7 +2793,8 @@ class CodexDesktopController extends CdpPageClient {
         return '';
       };
       const clientThreadID = anonymousDraftFingerprint();
-      const composerText = textOf(composer);
+      ${composerDraftContentStateSource()}
+      const draftContent = prismComposerDraftContentState();
       ${composerPrimaryActionFactsSource()}
       const primary = prismComposerPrimaryActionFacts();
       ${goalPlanDOMHelpersSource()}
@@ -2787,8 +2820,7 @@ class CodexDesktopController extends CdpPageClient {
         client_thread_id: clientThreadID,
         running,
         waiting_approval: waitingApproval,
-        composer_text: composerText,
-        composer_available: Boolean(composer && !composer.getAttribute('aria-disabled')),
+        ...draftContent,
         can_queue: canQueue,
         queue_pending: queuePending,
         primary_action: primaryAction,
@@ -4508,6 +4540,7 @@ module.exports = {
     conversationHeaderEntryOptionID,
     sameConversationHeaderMenuRows,
     conversationHeaderMenuRowsExpression,
+    composerDraftContentStateSource,
     composerEditableElementExpression,
     composerContainerElementExpression,
     visibleDesktopElementExpression,
