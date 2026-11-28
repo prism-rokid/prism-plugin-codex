@@ -1127,13 +1127,20 @@ function foregroundThreadIdExpression() {
     // Codex retains inactive conversation trees. The marker itself is always
     // display:none, so visibility must be checked on its layout parent.
     const candidates = [...document.querySelectorAll('[data-above-composer-conversation-id]')];
-    const foreground = candidates.find((marker) => {
+    const foreground = candidates.filter((marker) => {
       const parent = marker.parentElement;
       const rect = parent && parent.getBoundingClientRect();
       return Boolean(rect && rect.width > 0 && rect.height > 0);
     });
-    return normalizeThreadId(foreground && foreground.getAttribute('data-above-composer-conversation-id'));
+    const threadIds = [...new Set(foreground.map((marker) =>
+      normalizeThreadId(marker.getAttribute('data-above-composer-conversation-id'))).filter(Boolean))];
+    return threadIds.length === 1 ? threadIds[0] : '';
   })()`;
+}
+
+function foregroundScopedExpression(expression, threadID) {
+  if (!threadID) return expression;
+  return `(${foregroundThreadIdExpression()} === ${JSON.stringify(threadID)} ? ${expression} : null)`;
 }
 
 function visiblePermissionMenuRowsExpression() {
@@ -1836,7 +1843,77 @@ async function probeCodexMainPage(options = {}) {
   return (await diagnoseCodexMainPage(options)).page;
 }
 
+// 端口发现的所有候选、响应体和重试共用一个截止时间，避免逐层重置超时。
+function discoveryBudget(options = {}, defaultTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS) {
+  const timeoutMs = Number(options.timeoutMs ?? options.connectTimeoutMs) || defaultTimeoutMs;
+  const deadline = Math.min(Date.now() + Math.max(1, timeoutMs), Number(options.deadline) || Infinity);
+  return { deadline, signal: options.signal };
+}
+
+function discoveryAbortError(budget) {
+  return budget.signal?.aborted
+    ? budget.signal.reason || new Error("Codex CDP 端口发现已取消。")
+    : new Error("等待 Codex CDP 端口超时。");
+}
+
+function assertDiscoveryActive(budget) {
+  if (budget.signal?.aborted || Date.now() >= budget.deadline) throw discoveryAbortError(budget);
+}
+
+function discoveryCandidateBudget(budget, remainingCandidates = 1) {
+  // 缓存端口可能失效，为后续监听端口及显式托管启动保留预算。
+  return { ...budget, timeoutMs: Math.min(2000, Math.max(1,
+    Math.floor((budget.deadline - Date.now()) / (remainingCandidates + 1)),
+  )) };
+}
+
+async function withinDiscoveryBudget(budget, operation, maxTimeoutMs = Infinity) {
+  assertDiscoveryActive(budget);
+  const controller = new AbortController();
+  const remainingMs = Math.max(1, Math.min(budget.deadline - Date.now(), maxTimeoutMs));
+  let timer;
+  let onAbort;
+  const interrupted = new Promise((_, reject) => {
+    onAbort = () => {
+      const error = discoveryAbortError(budget);
+      controller.abort(error);
+      reject(error);
+    };
+    budget.signal?.addEventListener("abort", onAbort, { once: true });
+    timer = setTimeout(onAbort, remainingMs);
+  });
+  try {
+    // 即使替代 fetch 或进程查询忽略 signal，调用方也能及时退出。
+    return await Promise.race([Promise.resolve().then(() => {
+      assertDiscoveryActive(budget);
+      return operation(controller.signal);
+    }), interrupted]);
+  } finally {
+    clearTimeout(timer);
+    budget.signal?.removeEventListener("abort", onAbort);
+    controller.abort();
+  }
+}
+
+async function discoveryDelay(budget, delayMs) {
+  await withinDiscoveryBudget(budget, signal => new Promise((resolve, reject) => {
+    const finish = () => { signal.removeEventListener("abort", aborted); resolve(); };
+    const timer = setTimeout(finish, Math.min(delayMs, Math.max(1, budget.deadline - Date.now())));
+    const aborted = () => { clearTimeout(timer); reject(signal.reason); };
+    signal.addEventListener("abort", aborted, { once: true });
+  }));
+}
+
+async function discoveryJSON(url, budget, maxTimeoutMs = 2000) {
+  return withinDiscoveryBudget(budget, async signal => {
+    const response = await fetch(url, { cache: "no-store", signal });
+    if (!response.ok) throw new Error(`Codex CDP 端口响应异常：HTTP ${response.status}`);
+    return response.json();
+  }, maxTimeoutMs);
+}
+
 async function diagnoseCodexMainPage(options = {}) {
+  const budget = discoveryBudget(options, 2000);
   const overrideUrl = firstNonEmpty(process.env.PRISM_CODEX_CDP_URL, options.cdpUrl);
   const overridePort = firstNonEmpty(process.env.PRISM_CODEX_CDP_PORT, options.cdpPort ? String(options.cdpPort) : "");
   let listURLs = [];
@@ -1861,7 +1938,12 @@ async function diagnoseCodexMainPage(options = {}) {
         // managed main process's loopback listener.
       }
     }
-    listURLs.push(...await managedCdpListURLs(userDataDir));
+    try {
+      listURLs.push(...await withinDiscoveryBudget(budget, () => managedCdpListURLs(userDataDir),
+        Math.min(1000, Math.max(1, (budget.deadline - Date.now()) / 3))));
+    } catch {
+      if (budget.signal?.aborted || Date.now() >= budget.deadline) return { page: false, reachable: false };
+    }
   }
   listURLs = [...new Set(listURLs)];
   let reachable = false;
@@ -1871,16 +1953,11 @@ async function diagnoseCodexMainPage(options = {}) {
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     for (const listURL of listURLs) {
       try {
-        const requestOptions = { cache: "no-store", signal: AbortSignal.timeout(2000) };
-        const response = await fetch(listURL, requestOptions);
-        if (!response.ok) continue;
-        const targets = await response.json();
+        const targets = await discoveryJSON(listURL, budget);
         if (selectCodexMainPageTarget(targets)) return { page: true, reachable: true };
         if (reachable || !Array.isArray(targets)) continue;
         // 空列表也可能来自普通 HTTP 服务，检查 CDP 版本响应再确认可达。
-        const version = await fetch(new URL("version", listURL).href, requestOptions);
-        if (!version.ok) continue;
-        const protocol = await version.json();
+        const protocol = await discoveryJSON(new URL("version", listURL).href, budget);
         reachable = typeof protocol?.Browser === "string" &&
           /^\d+\.\d+$/.test(protocol["Protocol-Version"] || "") &&
           /^wss?:\/\//i.test(protocol.webSocketDebuggerUrl || "");
@@ -1888,9 +1965,10 @@ async function diagnoseCodexMainPage(options = {}) {
         // The next bounded attempt handles the normal DevToolsActivePort → page
         // target publication race. A final failure remains fail-closed.
       }
+      if (budget.signal?.aborted || Date.now() >= budget.deadline) return { page: false, reachable };
     }
     if (attempt + 1 < attempts && retryDelayMs > 0) {
-      await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+      try { await discoveryDelay(budget, retryDelayMs); } catch { return { page: false, reachable }; }
     }
   }
   return { page: false, reachable };
@@ -2178,6 +2256,18 @@ function spawnManagedCodex(appPath, args, userDataDir = "") {
 class CodexDesktopController extends CdpPageClient {
   constructor(options = {}) {
     super(options);
+    // 每次建链使用独立的 SDK 客户端，旧连接的回调只能清理旧请求。
+    this._cdpClient = new CdpPageClient(options);
+    this._readyPromise = null;
+    this._readyAbort = null;
+    for (const key of ["ws", "connected"]) {
+      Object.defineProperty(this, key, {
+        configurable: true,
+        enumerable: true,
+        get: () => this._cdpClient[key],
+        set: (value) => { this._cdpClient[key] = value; },
+      });
+    }
     this.pageTarget = null;
     this.managedProcess = null;
     this.managedUserDataDir = "";
@@ -2187,19 +2277,68 @@ class CodexDesktopController extends CdpPageClient {
   }
 
   async ensureReady() {
-    // Check both the connected flag AND the actual ws readyState. The onclose handler
-    // clears `connected`, but there is a window where the socket drops without onclose
-    // firing yet, leaving connected=true while ws.readyState is CLOSING/CLOSED.
-    const wsOpen = this.ws && this.ws.readyState === 1;
-    if (!this.connected || !wsOpen) {
-      this.connected = false;
-      const target = await this.resolvePageTarget();
-      this.pageTarget = target;
-      await this.connectToPage(target.webSocketDebuggerUrl);
+    if (this._readyPromise) return this._readyPromise;
+    const hostReady = new AbortController();
+    this._readyAbort = hostReady;
+    const ready = (async () => {
+      const wsOpen = this.ws && this.ws.readyState === 1;
+      if (!this.connected || !wsOpen) {
+        this.connected = false;
+        const target = await this.resolvePageTarget({ signal: hostReady.signal });
+        hostReady.signal.throwIfAborted();
+        this.pageTarget = target;
+        await this.connectToPage(target.webSocketDebuggerUrl);
+      }
+      hostReady.signal.throwIfAborted();
+      await this.waitForReady();
+      hostReady.signal.throwIfAborted();
+      await this.installInteractiveSurfaceCapabilityTracker();
+      hostReady.signal.throwIfAborted();
+      return this;
+    })();
+    this._readyPromise = ready;
+    try {
+      return await ready;
+    } finally {
+      if (this._readyPromise === ready) {
+        this._readyPromise = null;
+        this._readyAbort = null;
+      }
     }
-    await this.waitForReady();
-    await this.installInteractiveSurfaceCapabilityTracker();
+  }
+
+  replaceCdpClient() {
+    const previous = this._cdpClient;
+    const client = new CdpPageClient(this.options);
+    this._cdpClient = client;
+    void previous.close();
+    return client;
+  }
+
+  async connectToPage(url, enableDomains) {
+    const client = this.replaceCdpClient();
+    await client.connectToPage(url, enableDomains);
+    if (this._cdpClient !== client) throw new Error("CDP connection closed");
     return this;
+  }
+
+  async openWebSocket(url) {
+    const client = this.replaceCdpClient();
+    await client.openWebSocket(url);
+    if (this._cdpClient !== client) throw new Error("CDP connection closed");
+  }
+
+  async send(method, params = {}) {
+    return this._cdpClient.send(method, params);
+  }
+
+  async close() {
+    this._readyAbort?.abort(new Error("CDP connection closed"));
+    this._readyAbort = null;
+    this._readyPromise = null;
+    const previous = this._cdpClient;
+    this._cdpClient = new CdpPageClient(this.options);
+    await previous.close();
   }
 
   // Track the DOM relationship between the permission control and its menu.
@@ -2238,60 +2377,65 @@ class CodexDesktopController extends CdpPageClient {
     })()`);
   }
 
-  async resolvePageTarget() {
+  async resolvePageTarget(options = {}) {
+    const budget = discoveryBudget({ ...this.options, ...options });
+    assertDiscoveryActive(budget);
     const targetUserDataDir = firstNonEmpty(this.options.userDataDir, process.env.PRISM_CODEX_USER_DATA_DIR, defaultProfileDir());
     const overrideUrl = firstNonEmpty(process.env.PRISM_CODEX_CDP_URL, this.options.cdpUrl);
     if (overrideUrl) {
       const listUrl = overrideUrl.endsWith("/json/list") ? overrideUrl : overrideUrl.replace(/\/$/, "") + "/json/list";
-      return this.fetchPageTarget(listUrl);
+      return this.fetchPageTarget(listUrl, budget);
     }
     const overridePort = firstNonEmpty(process.env.PRISM_CODEX_CDP_PORT, this.options.cdpPort ? String(this.options.cdpPort) : "");
     if (overridePort) {
-      return this.fetchPageTarget(`http://127.0.0.1:${overridePort}/json/list`);
+      return this.fetchPageTarget(`http://127.0.0.1:${overridePort}/json/list`, budget);
     }
     const devtoolsFile = firstNonEmpty(process.env.PRISM_CODEX_DEVTOOLS_FILE, this.options.devtoolsFile);
     if (devtoolsFile && fs.existsSync(devtoolsFile)) {
-      return this.fetchPageTarget(await this.devtoolsListUrlFromFile(devtoolsFile));
+      return this.fetchPageTarget(await this.devtoolsListUrlFromFile(devtoolsFile), budget);
     }
     const defaultPortFile = targetUserDataDir === defaultProfileDir() ? defaultDevtoolsFile() : path.join(targetUserDataDir, "DevToolsActivePort");
     if (fs.existsSync(defaultPortFile)) {
       try {
-        return await this.fetchPageTarget(await this.devtoolsListUrlFromFile(defaultPortFile));
+        return await this.fetchPageTarget(await this.devtoolsListUrlFromFile(defaultPortFile), discoveryCandidateBudget(budget));
       } catch {
-        // Electron can leave DevToolsActivePort behind after ChatGPT/Codex exits.
-        // Treat the default file as a cache, not as authoritative CDP state.
-        try { fs.unlinkSync(defaultPortFile); } catch {}
+        assertDiscoveryActive(budget);
+        // Electron 维护这个文件。渲染器启动或重载较慢时，后续轮次仍可用它重试。
       }
     }
-    for (const listURL of await managedCdpListURLs(targetUserDataDir)) {
+    const listURLs = await withinDiscoveryBudget(budget, () => managedCdpListURLs(targetUserDataDir));
+    for (const [index, listURL] of listURLs.entries()) {
       try {
-        return await this.fetchPageTarget(listURL);
+        return await this.fetchPageTarget(listURL, discoveryCandidateBudget(budget, listURLs.length - index));
       } catch {
         // Keep the CDP-only contract: an open loopback listener is accepted
         // only when it exposes the actual Codex workspace target.
       }
+      assertDiscoveryActive(budget);
     }
     // A watcher is an observer. It must never turn an explicit user close into
     // a new Desktop process. Dashboard owns the only explicit managed launch
     // action and starts the app before the plugin reconnects over CDP.
     const allowManagedLaunch = this.options.allowManagedLaunch === true;
-    const running = await isCodexRunning(targetUserDataDir);
+    const running = await withinDiscoveryBudget(budget, () => isCodexRunning(targetUserDataDir));
     if (running) {
       const allowManagedRelaunch = allowManagedLaunch && this.options.allowManagedRelaunch === true;
       if (allowManagedRelaunch) {
-        await stopExistingCodexProcess(targetUserDataDir);
-        const stopped = await waitForCodexStopped(this.options.stopTimeoutMs || 15000, targetUserDataDir);
+        await withinDiscoveryBudget(budget, () => stopExistingCodexProcess(targetUserDataDir));
+        const stopped = await withinDiscoveryBudget(budget, () => waitForCodexStopped(
+          Math.min(this.options.stopTimeoutMs || 15000, Math.max(1, budget.deadline - Date.now())), targetUserDataDir,
+        ));
         if (!stopped) {
           throw new Error("Codex 已在运行，但 Prism 在受控重启模式下未能及时关闭旧进程。");
         }
-        return this.launchManagedTarget();
+        return this.launchManagedTarget(budget);
       }
       throw new Error(
         "当前 Codex 已运行但没有暴露可用的 CDP 端口，无法走 CDP-only 控制。请先关闭 Codex 后让 Prism 管理启动；如同时运行了多个 Codex/ChatGPT 实例，请先关闭多余实例。普通用户优先在 Prism Dashboard 的插件页使用托管启动或手动指定应用路径 / 数据目录，只有开发者模式才建议配置 PRISM_CODEX_CDP_PORT / PRISM_CODEX_CDP_URL。",
       );
     }
     if (allowManagedLaunch) {
-      return this.launchManagedTarget();
+      return this.launchManagedTarget(budget);
     }
     throw new Error("Codex Desktop 未运行。请在 Prism Dashboard 的插件页启动 Codex 后再连接。");
   }
@@ -2305,13 +2449,14 @@ class CodexDesktopController extends CdpPageClient {
     return `http://127.0.0.1:${port}/json/list`;
   }
 
-  async fetchPageTarget(listUrl) {
-    const deadline = Date.now() + (this.options.connectTimeoutMs || DEFAULT_CONNECT_TIMEOUT_MS);
+  async fetchPageTarget(listUrl, options = {}) {
+    const budget = discoveryBudget({ ...this.options, ...options });
     let lastError = null;
-    while (Date.now() < deadline) {
+    while (Date.now() < budget.deadline) {
+      assertDiscoveryActive(budget);
       try {
-        const response = await fetch(listUrl, { cache: "no-store" });
-        const targets = await response.json();
+        const targets = await discoveryJSON(listUrl, budget);
+        assertDiscoveryActive(budget);
         const page = selectCodexMainPageTarget(targets);
         if (page) {
           return page;
@@ -2319,18 +2464,22 @@ class CodexDesktopController extends CdpPageClient {
       } catch (err) {
         lastError = err;
       }
-      await sleep(300);
+      assertDiscoveryActive(budget);
+      await discoveryDelay(budget, 300);
     }
-    throw lastError || new Error(`Codex CDP page target not found from ${listUrl}`);
+    throw lastError || new Error(`未从 Codex CDP 端口找到工作区页面：${listUrl}`);
   }
 
-  async launchManagedTarget() {
+  async launchManagedTarget(options = {}) {
+    const budget = discoveryBudget({ ...this.options, ...options });
+    assertDiscoveryActive(budget);
     const userDataDir = firstNonEmpty(this.options.userDataDir, process.env.PRISM_CODEX_USER_DATA_DIR, defaultProfileDir());
     const appPath = codexAppPath();
     if (!appPath) {
       throw new Error("未找到 Codex 可执行路径，请设置 PRISM_CODEX_APP_PATH。");
     }
     cleanupStaleProfileArtifacts(userDataDir);
+    assertDiscoveryActive(budget);
     const args = [
       `--user-data-dir=${userDataDir}`,
       "--remote-debugging-port=0",
@@ -2343,26 +2492,32 @@ class CodexDesktopController extends CdpPageClient {
     this.managedDevtoolsFile = path.join(userDataDir, "DevToolsActivePort");
     this.managedAppPath = appPath;
     this.managedLauncherExitsAfterStart = launcherExitsAfterStart;
-    const deadline = Date.now() + (this.options.connectTimeoutMs || DEFAULT_CONNECT_TIMEOUT_MS);
-    while (Date.now() < deadline) {
+    while (Date.now() < budget.deadline) {
+      assertDiscoveryActive(budget);
       if (fs.existsSync(this.managedDevtoolsFile)) {
-        return this.fetchPageTarget(await this.devtoolsListUrlFromFile(this.managedDevtoolsFile));
-      }
-      for (const listURL of await managedCdpListURLs(userDataDir)) {
         try {
-          return await this.fetchPageTarget(listURL);
+          return await this.fetchPageTarget(await this.devtoolsListUrlFromFile(this.managedDevtoolsFile), discoveryCandidateBudget(budget));
+        } catch {
+          assertDiscoveryActive(budget);
+        }
+      }
+      const listURLs = await withinDiscoveryBudget(budget, () => managedCdpListURLs(userDataDir));
+      for (const [index, listURL] of listURLs.entries()) {
+        try {
+          return await this.fetchPageTarget(listURL, discoveryCandidateBudget(budget, listURLs.length - index));
         } catch {
           // Continue until the managed main process publishes the workspace.
         }
+        assertDiscoveryActive(budget);
       }
       if (child.exitCode !== null) {
         if (launcherExitsAfterStart && child.exitCode === 0) {
-          await sleep(250);
+          await discoveryDelay(budget, 250);
           continue;
         }
         throw new Error(`Codex 启动失败，exit=${child.exitCode}`);
       }
-      await sleep(250);
+      await discoveryDelay(budget, 250);
     }
     throw new Error("等待 Codex CDP 端口超时。");
   }
@@ -2388,8 +2543,8 @@ class CodexDesktopController extends CdpPageClient {
     );
   }
 
-  async focusComposer() {
-    const composer = composerEditableElementExpression();
+  async focusComposer(threadID = "") {
+    const composer = foregroundScopedExpression(composerEditableElementExpression(), threadID);
     await this.clickElement(composer);
     await this.evaluate(`(() => { const el = (${composer}); if (!el) return false; el.focus(); return true; })()`);
   }
@@ -2411,10 +2566,11 @@ class CodexDesktopController extends CdpPageClient {
     }
   }
 
-  async clearComposer() {
-    await this.focusComposer();
+  async clearComposer(threadID = "") {
+    await this.focusComposer(threadID);
     await this.keyPress("a", [process.platform === "darwin" ? "meta" : "control"]);
     await sleep(40);
+    await this.assertForegroundThread(threadID);
     await this.keyPress("Backspace");
   }
 
@@ -2425,8 +2581,8 @@ class CodexDesktopController extends CdpPageClient {
     }
   }
 
-  async clearComposerAttachments() {
-    await this.evaluate(`(() => {
+  async clearComposerAttachments(threadID = "") {
+    const remove = `(() => {
       const visible = (element) => {
         const rect = element && element.getBoundingClientRect();
         return Boolean(rect && rect.width > 0 && rect.height > 0);
@@ -2441,12 +2597,14 @@ class CodexDesktopController extends CdpPageClient {
         button.click();
       }
       return buttons.length;
-    })()`);
+    })()`;
+    const result = await this.evaluate(foregroundScopedExpression(remove, threadID));
+    if (threadID && result === null) throw new Error("control_target_stale: Codex 桌面已切换会话。");
   }
 
-  async resetComposer() {
-    await this.clearComposerAttachments();
-    await this.clearComposer();
+  async resetComposer(threadID = "") {
+    await this.clearComposerAttachments(threadID);
+    await this.clearComposer(threadID);
   }
 
   async waitForComposerSendReady(timeoutMs = DEFAULT_ACTION_TIMEOUT_MS) {
@@ -2475,7 +2633,7 @@ class CodexDesktopController extends CdpPageClient {
     throw new Error(`queue_unavailable: native composer did not become submit-ready: ${JSON.stringify(diagnostic)}`);
   }
 
-  async clickComposerPrimaryButton(expectedSubmissionKind = "") {
+  async clickComposerPrimaryButton(expectedSubmissionKind = "", threadID = "") {
     const facts = await this.evaluate(composerPrimaryActionRuntimeExpression());
     if (!facts || facts.usable !== true || facts.enabled !== true || facts.submit_disabled === true) {
       throw new Error("control_target_stale");
@@ -2487,7 +2645,7 @@ class CodexDesktopController extends CdpPageClient {
     if (expectedSubmissionKind && expectedSubmissionKind !== submissionKind) {
       throw new Error("control_target_stale");
     }
-    const action = composerPrimaryActionElementExpression(submissionKind);
+    const action = foregroundScopedExpression(composerPrimaryActionElementExpression(submissionKind), threadID);
     const available = await this.evaluate(`Boolean(${action})`);
     if (!available) {
       throw new Error("control_target_stale");
@@ -2562,7 +2720,7 @@ class CodexDesktopController extends CdpPageClient {
     throw new Error("Codex message submission did not complete in time.");
   }
 
-  async attachLocalFile(localPath, fileName = "", mimeType = "") {
+  async attachLocalFile(localPath, fileName = "", mimeType = "", threadID = "") {
     const resolvedPath = path.resolve(String(localPath || ""));
     if (!resolvedPath || !fs.existsSync(resolvedPath)) {
       throw new Error("Codex CDP 本地附件不存在。");
@@ -2571,7 +2729,7 @@ class CodexDesktopController extends CdpPageClient {
       name: firstNonEmpty(fileName, path.basename(resolvedPath)),
       mimeType: firstNonEmpty(mimeType, "application/octet-stream"),
     };
-    await this.focusComposer();
+    await this.focusComposer(threadID);
     // Browser-created Files lose Electron's native filesystem backing. Even
     // adding File.path does not help getPathForFile(), so image handlers fall
     // back to data URIs which local Codex turns cannot open as image paths.
@@ -2591,7 +2749,7 @@ class CodexDesktopController extends CdpPageClient {
       const target = await this.send('DOM.querySelector', { nodeId: dom.root.nodeId, selector: `#${inputID}` });
       if (!target.nodeId) throw new Error('native_attachment_file_transport_unavailable');
       await this.send('DOM.setFileInputFiles', { nodeId: target.nodeId, files: [resolvedPath] });
-      injection = await this.evaluate(`(async () => {
+      const inject = `(async () => {
       const composer = ${composerContainerElementExpression()};
       if (!composer) return { ok: false, reason: 'composer_missing' };
       const fiberFor = (element) => {
@@ -2644,10 +2802,12 @@ class CodexDesktopController extends CdpPageClient {
         }
       }
       return invoked > 0 ? { ok: true, handler_count: invoked } : { ok: false, reason: 'native_attachment_handler_unavailable' };
-      })()`);
+      })()`;
+      injection = await this.evaluate(foregroundScopedExpression(inject, threadID));
     } finally {
       await this.evaluate(`document.getElementById(${JSON.stringify(inputID)})?.remove()`).catch(() => {});
     }
+    if (threadID && injection === null) throw new Error("control_target_stale: Codex 桌面已切换会话。");
     if (!injection || injection.ok !== true) {
       const reason = firstNonEmpty(injection && injection.reason, "native_attachment_injection_failed");
       throw new Error(`Codex CDP attachment injection unavailable: ${reason}${injection?.detail ? ` (${String(injection.detail).slice(0, 240)})` : ""}`);
@@ -2678,9 +2838,11 @@ class CodexDesktopController extends CdpPageClient {
   }
 
   async sendMessage(payload = {}) {
+    const threadID = firstNonEmpty(payload.threadID);
     const text = firstNonEmpty(payload.text);
     const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
-    await this.resetComposer();
+    await this.assertForegroundThread(threadID);
+    await this.resetComposer(threadID);
     for (const attachment of attachments) {
       const localPath = firstNonEmpty(attachment && attachment.localPath, attachment && attachment.local_path);
       const name = firstNonEmpty(attachment && attachment.name);
@@ -2688,20 +2850,28 @@ class CodexDesktopController extends CdpPageClient {
       if (!localPath) {
         throw new Error("Codex CDP 缺少 Hub materialize 的本地附件路径。");
       }
-      await this.attachLocalFile(localPath, name, mimeType);
+      await this.assertForegroundThread(threadID);
+      await this.attachLocalFile(localPath, name, mimeType, threadID);
       await sleep(80);
     }
     if (text) {
+      await this.assertForegroundThread(threadID);
       await this.insertText(text);
     }
     const ready = await this.waitForComposerSendReady();
     const previousQueueItemIDs = ready.submission_kind === "queue" ? await this.queuedMessageIDs() : null;
     await sleep(80);
-    const submission = await this.clickComposerPrimaryButton(ready.submission_kind);
-    if (submission.submission_kind === "queue") {
-      return this.waitForQueuedMessageSubmission(previousQueueItemIDs);
+    const submission = await this.clickComposerPrimaryButton(ready.submission_kind, threadID);
+    try {
+      const outcome = submission.submission_kind === "queue"
+        ? await this.waitForQueuedMessageSubmission(previousQueueItemIDs)
+        : await this.waitForComposerSubmission();
+      await this.assertForegroundThread(threadID);
+      return outcome;
+    } catch (error) {
+      if (!threadID) throw error;
+      throw new Error("delivery_indeterminate: 已触发 Codex 桌面提交，但无法确认原线程中的结果。", { cause: error });
     }
-    return this.waitForComposerSubmission();
   }
 
   async composerRuntimeState() {
@@ -3142,7 +3312,11 @@ class CodexDesktopController extends CdpPageClient {
 
   async currentThreadId() {
     await this.ensureReady();
-    return this.evaluate(foregroundThreadIdExpression()).catch(() => "");
+    return this.readForegroundThreadId().catch(() => "");
+  }
+
+  async readForegroundThreadId() {
+    return this.evaluate(foregroundThreadIdExpression());
   }
 
   async isThreadSelected(threadId) {
@@ -3150,6 +3324,12 @@ class CodexDesktopController extends CdpPageClient {
     if (!normalized) return false;
     const current = String(await this.currentThreadId()).trim();
     return current === normalized || current.endsWith(`:${normalized}`);
+  }
+
+  async assertForegroundThread(threadID) {
+    if (threadID && !await this.evaluate(foregroundScopedExpression("true", threadID))) {
+      throw new Error("control_target_stale: Codex 桌面已切换会话。");
+    }
   }
 
   async projectIdForCwd(cwd) {
@@ -4442,22 +4622,23 @@ class CodexDesktopController extends CdpPageClient {
     })()`);
   }
 
-  async interrupt() {
+  async interrupt(threadID = "") {
     await this.ensureReady();
     // Recheck the native Composer state in the target expression, then use
     // CDP's trusted mouse input. Synthetic DOM events can look like a click to
     // the caller without activating Codex's React handler.
-    await this.clickElement(composerStopElementExpression()).catch((error) => {
+    await this.clickElement(foregroundScopedExpression(composerStopElementExpression(), threadID)).catch((error) => {
       throw new Error(`interrupt_control_unavailable: ${error.message}`);
     });
     // A dispatched click is not proof that Codex stopped the active run.
     // Wait until the Composer reports that response generation has ended so
     // Prism does not acknowledge a no-op as a successful interrupt.
-    await this.waitFor(`(() => {
+    const stopped = `(() => {
       ${composerPrimaryActionFactsSource()}
       const facts = prismComposerPrimaryActionFacts();
       return Boolean(facts && facts.usable === true && facts.response_in_progress !== true);
-    })()`, this.options?.actionTimeoutMs || DEFAULT_ACTION_TIMEOUT_MS, 100);
+    })()`;
+    await this.waitFor(foregroundScopedExpression(stopped, threadID), this.options?.actionTimeoutMs || DEFAULT_ACTION_TIMEOUT_MS, 100);
   }
 
   async resolveApproval(actionId, inputValue = "") {

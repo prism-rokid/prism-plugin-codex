@@ -86,13 +86,14 @@ const LIVE_CONTROL_CACHE_MAX = 256;
 const THREAD_METADATA_CACHE_MAX = 256;
 const liveControlOptionsCache = new Map();
 let desktopWatchTimer = null;
-let desktopWatchInFlight = false;
+let desktopWatchInFlight = null;
 let desktopControlInFlight = false;
 // A control can finish after the native UI has already accepted a send, while
 // the watcher is still barred from reading that transient DOM. Preserve the
 // requested refresh until the exclusive CDP section releases it.
 const deferredDesktopWatchBursts = new Map();
 const DESKTOP_WATCH_UNAVAILABLE_AFTER_POLLS = 3;
+const DESKTOP_CONTROL_WATCH_WAIT_MS = 5000;
 let desktopWatchState = createDesktopWatchState();
 let desktopDirectoryState = createDesktopDirectoryState();
 // 目录快照确认的附属线程集合与代次。排队事件在发布后、投递前若原生关系
@@ -132,6 +133,7 @@ function createDesktopWatchTelemetry() {
     polls_started: 0,
     polls_completed: 0,
     polls_failed: 0,
+    polls_discarded: 0,
     polls_skipped_in_flight: 0,
     polls_skipped_control: 0,
     poll_cost_ms_total: 0,
@@ -165,6 +167,7 @@ function logDesktopWatchTelemetry(force = false) {
   console.error(
     `[codex] watcher.metrics polls_started=${metrics.polls_started}`
       + ` polls_completed=${metrics.polls_completed}`
+      + ` polls_discarded=${metrics.polls_discarded}`
       + ` polls_failed=${metrics.polls_failed}`
       + ` polls_skipped_in_flight=${metrics.polls_skipped_in_flight}`
       + ` polls_skipped_control=${metrics.polls_skipped_control}`
@@ -5164,7 +5167,7 @@ async function conversationDetailSnapshotFromDesktop(threadID = "", options = {}
   if (!isThreadID(threadID)) {
     throw new Error("codex detail snapshot requires a resolved Codex thread id");
   }
-  const controller = await codexDesktopController();
+  const controller = options.controller || await codexDesktopController();
   const thread = withRolloutContextMetadata(await findThreadByID(threadID).catch(() => null));
   const recordedControls = recordedThreadControlValues(thread);
   let selectResult = null;
@@ -5172,21 +5175,20 @@ async function conversationDetailSnapshotFromDesktop(threadID = "", options = {}
     selectResult = await controller.selectThread(threadID);
     await sleep(Number.isFinite(options.settleMs) ? options.settleMs : 180);
   }
-  const rawRuntimeSnapshot = await currentDesktopRuntimeSnapshot().catch(() => null);
-  const runtimeSnapshot = runtimeWithRecordedTerminal(
+  const rawRuntimeSnapshot = await controller.currentThreadRuntimeState().catch(() => null);
+  const observedRuntimeSnapshot = runtimeWithRecordedTerminal(
     rawRuntimeSnapshot,
     latestRecordedTurnLifecycle(thread && thread.rolloutPath, threadID),
   );
-  const activeThreadID = firstNonEmpty(runtimeSnapshot && runtimeSnapshot.current_thread_id);
+  const activeThreadID = firstNonEmpty(observedRuntimeSnapshot && observedRuntimeSnapshot.current_thread_id);
   if (options.selectThread === false && isThreadID(activeThreadID) && activeThreadID !== threadID) {
     throw new Error("codex desktop target is not foreground");
   }
   // Detail snapshots read only the closed composer state. Menu rows remain
   // unavailable until an explicit menu_session.describe made by a user tap.
   const desktopForeground = activeThreadID === threadID;
-  const foregroundTransition = desktopForeground
-    ? observeDesktopWatchForeground(desktopWatchState, activeThreadID)
-    : null;
+  // 过期详情仍可展示目标线程的存储数据，前台 Composer 和运行状态必须属于目标线程。
+  const runtimeSnapshot = desktopForeground ? observedRuntimeSnapshot : null;
   const [liveCurrent, livePinned, liveQueue] = desktopForeground
     ? await Promise.all([
       readLiveComposerControls(threadID, controller, { selectThread: false, preferThreadMetadataFallback: false }).catch(() => null),
@@ -5197,7 +5199,6 @@ async function conversationDetailSnapshotFromDesktop(threadID = "", options = {}
   const messagesSignature = await threadMessagesSignature(threadID).catch(() => "");
   const cachedOptions = liveControlOptionsCacheEntry(threadID);
   const projectedRuntime = runtimeWithLiveQueue(runtimeSnapshot, liveQueue);
-  rememberVisibleGoalBody(threadID, goalDetailFromRuntime(projectedRuntime));
   const currentRun = controlsRuntimeFromDesktopSnapshot(threadID, projectedRuntime) || {
     status: "idle",
     summary: "当前会话空闲。",
@@ -5210,7 +5211,6 @@ async function conversationDetailSnapshotFromDesktop(threadID = "", options = {}
     : [];
   if (desktopForeground) {
     interactiveControls = await readCodexInteractiveControls(controller);
-    rememberLiveControlOptions(threadID, { interactiveControls });
   }
   const approval = currentRun && currentRun.approval && typeof currentRun.approval === "object"
     ? currentRun.approval
@@ -5218,16 +5218,21 @@ async function conversationDetailSnapshotFromDesktop(threadID = "", options = {}
   const rawInteractiveSurface = desktopForeground
     ? await controller.readInteractiveSurface().catch(() => null)
     : null;
-  const interactiveSurface = interactiveSurfaceForForeground(
-    desktopWatchState,
-    foregroundTransition,
-    threadID,
-    rawInteractiveSurface,
-  );
   const [conversationMenuAvailable, actions] = await Promise.all([
     desktopForeground ? controller.conversationHeaderMenuAvailable().catch(() => false) : false,
     Promise.resolve(buildDetailActions(threadID, Boolean(livePinned), controlsLocked)),
   ]);
+  if (desktopForeground) await assertDesktopForegroundUnchanged(controller, rawRuntimeSnapshot);
+  const foregroundTransition = desktopForeground
+    ? observeDesktopWatchForeground(desktopWatchState, activeThreadID)
+    : null;
+  const interactiveSurface = desktopForeground ? interactiveSurfaceForForeground(
+    desktopWatchState, foregroundTransition, threadID, rawInteractiveSurface,
+  ) : null;
+  if (desktopForeground) {
+    rememberLiveControlOptions(threadID, { interactiveControls });
+    rememberVisibleGoalBody(threadID, goalDetailFromRuntime(projectedRuntime));
+  }
   const nowMs = Date.now();
   return {
     native_conversation_id: threadID,
@@ -5360,12 +5365,36 @@ function runtimeWithLiveQueue(runtime = null, queue = null) {
 
 const WATCH_INTELLIGENCE_TTL_MS = 5000;
 
+function desktopForegroundIdentity(runtime = {}) {
+  const threadID = firstNonEmpty(runtime && runtime.current_thread_id);
+  if (isThreadID(threadID)) return `thread:${threadID}`;
+  const draft = anonymousDraftFingerprint(runtime);
+  return draft ? `draft:${draft}` : "";
+}
+
+async function assertDesktopForegroundUnchanged(controller, runtime) {
+  const expected = desktopForegroundIdentity(runtime);
+  // 无法识别前台身份时沿用已有的离线数据。
+  if (!expected) return;
+  // 已有线程只需读取前台标记，避免每次核对都重复扫描 Composer 和审批控件。
+  const observed = isThreadID(runtime.current_thread_id)
+    ? { current_thread_id: await controller.readForegroundThreadId() }
+    : await controller.currentThreadRuntimeState();
+  if (desktopForegroundIdentity(observed) !== expected) {
+    const error = new Error("control_target_stale: Codex desktop foreground changed during snapshot");
+    error.code = "desktop_foreground_changed";
+    throw error;
+  }
+}
+
 async function currentDesktopConversationSnapshot(options = {}) {
+  const checkpoint = typeof options.checkpoint === "function" ? options.checkpoint : () => {};
   const suppliedController = options && options.controller ? options.controller : null;
   const suppliedRuntime = options && options.runtime && typeof options.runtime === "object" ? options.runtime : null;
   return (suppliedController ? Promise.resolve(suppliedController) : codexDesktopController())
     .then(async (controller) => {
       const rawRuntime = suppliedRuntime || await controller.currentThreadRuntimeState().catch(() => null);
+      checkpoint();
       const currentThreadId = firstNonEmpty(rawRuntime && rawRuntime.current_thread_id);
       let composer = null;
       let queue = null;
@@ -5374,12 +5403,19 @@ async function currentDesktopConversationSnapshot(options = {}) {
       let thread = null;
       if (isThreadID(currentThreadId)) {
         thread = withRolloutContextMetadata(await findThreadByID(currentThreadId).catch(() => null));
+        checkpoint();
         const liveComposer = await readLiveComposerControls(currentThreadId, controller, { selectThread: false }).catch(() => null);
+        checkpoint();
         composer = liveComposer;
         queue = await currentDesktopQueueSnapshot(currentThreadId, controller).catch(() => null);
+        checkpoint();
         pinned = await controller.threadPinned(currentThreadId).catch(() => null);
+        checkpoint();
         conversationMenuAvailable = await controller.conversationHeaderMenuAvailable().catch(() => false);
+        checkpoint();
       }
+      await assertDesktopForegroundUnchanged(controller, rawRuntime);
+      checkpoint();
       const runtime = runtimeWithRecordedTerminal(
         rawRuntime,
         latestRecordedTurnLifecycle(thread && thread.rolloutPath, currentThreadId),
@@ -5395,7 +5431,10 @@ async function currentDesktopConversationSnapshot(options = {}) {
         thread,
       };
     })
-    .catch(() => null);
+    .catch((error) => {
+      if (error && (error.code === "desktop_foreground_changed" || error.code === "desktop_snapshot_expired")) throw error;
+      return null;
+    });
 }
 
 function threadStatusFromDesktopRuntime(runtime = {}) {
@@ -6113,19 +6152,15 @@ async function send(session, msg) {
     const controller = await codexDesktopController();
     const sendActionLabel = attachments.length ? "send.cdpMessageWithAttachments" : "send.cdpMessage";
     const sendActionStartedAt = Date.now();
-    let submission = null;
-    try {
-      submission = await controller.sendMessage({
-        text,
-        attachments: attachments.map((attachment) => ({
-          localPath: attachment.LocalPath,
-          name: attachment.Name,
-          mimeType: attachment.MIMEType,
-        })),
-      });
-    } catch (error) {
-      throw error;
-    }
+    const submission = await controller.sendMessage({
+      threadID,
+      text,
+      attachments: attachments.map((attachment) => ({
+        localPath: attachment.LocalPath,
+        name: attachment.Name,
+        mimeType: attachment.MIMEType,
+      })),
+    });
     rememberThreadAttachmentNames(threadID, firstNonEmpty(msg && msg.PrismMessageID), text, attachments, sendStartedAt);
     logTiming(sendActionLabel, sendActionStartedAt);
     if (!runContext) {
@@ -6465,7 +6500,7 @@ function desktopTerminalRunEvent(threadID, status, summary, sessionHint, detailS
   };
 }
 
-async function emitDesktopTerminalRunEvents(threadID, status, detailSnapshot, sessionHint, { requireFresh = false } = {}) {
+async function emitDesktopTerminalRunEvents(threadID, status, detailSnapshot, sessionHint, { requireFresh = false, beforePublish = null } = {}) {
   const evidenceInfo = await rolloutEvidence(threadID);
   if (requireFresh && !desktopTerminalFreshEnough(evidenceInfo.mtimeMs)) {
     return;
@@ -6474,10 +6509,9 @@ async function emitDesktopTerminalRunEvents(threadID, status, detailSnapshot, se
   if (!terminal.terminal || !terminal.terminalID) return;
   const nativeStatus = terminal.failed ? "failed" : terminal.interrupted ? "interrupted" : "completed";
   if (nativeStatus !== status) return;
-  const normalized = desktopTerminalTransition(threadID, nativeStatus, terminal.terminalID, terminal.terminalAt);
-  if (!normalized) return;
-  persistDesktopTerminalRuns();
-  desktopRunFileWatchStop(threadID);
+  // 已发布的原生任务可跳过摘要读取。确认当前帧可发布后才记录去重。
+  if (desktopTerminalRunEmitted.get(threadID)?.terminalID === terminal.terminalID) return;
+  const normalized = nativeStatus;
   const run = detailSnapshot && typeof detailSnapshot.run === "object" ? detailSnapshot.run : null;
   const runSummary = run && String(run.status || "").toLowerCase() === normalized ? firstNonEmpty(run.summary) : "";
   let latestSummary = "";
@@ -6485,12 +6519,17 @@ async function emitDesktopTerminalRunEvents(threadID, status, detailSnapshot, se
     const latest = await latestAssistantSummary(threadID).catch(() => null);
     latestSummary = firstNonEmpty(latest && latest.summary);
   }
+  const attachedSideChat = await threadIsAttachedSideChat(threadID);
+  if (beforePublish) await beforePublish();
+  if (!desktopTerminalTransition(threadID, nativeStatus, terminal.terminalID, terminal.terminalAt)) return;
+  persistDesktopTerminalRuns();
+  desktopRunFileWatchStop(threadID);
   const event = desktopTerminalRunEvent(
     threadID,
     normalized,
     desktopTerminalRunSummary(normalized, runSummary, latestSummary),
     // 终态事件同样经过目录准入：附属侧聊只保留绑定路由，不重新发布目录提示。
-    await threadIsAttachedSideChat(threadID) ? null : (sessionHint === null ? null : sessionHint),
+    attachedSideChat ? null : (sessionHint === null ? null : sessionHint),
     detailSnapshot,
     terminal.terminalID,
   );
@@ -6951,13 +6990,26 @@ function enqueueDesktopControlMenuWarm(operation) {
   return run;
 }
 
+async function waitForDesktopWatch(watcher, timeoutMs = DESKTOP_CONTROL_WATCH_WAIT_MS) {
+  if (!watcher) return;
+  let timer;
+  try {
+    await Promise.race([
+      watcher,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("desktop_watch_busy: Codex 桌面状态采样仍在进行，请重试。")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function runExclusiveDesktopControl(operation) {
   return enqueueDesktopControlMenuWarm(async () => {
     desktopControlInFlight = true;
     try {
-      while (desktopWatchInFlight) {
-        await sleep(25);
-      }
+      await waitForDesktopWatch(desktopWatchInFlight);
       return await operation();
     } finally {
       desktopControlInFlight = false;
@@ -6966,7 +7018,9 @@ async function runExclusiveDesktopControl(operation) {
   });
 }
 
-async function pollDesktopWatch() {
+const DESKTOP_WATCH_SAMPLE_BUDGET_MS = 5000;
+
+async function pollDesktopWatch(options = {}) {
   if (desktopWatchSubscribers.size === 0) return;
   if (desktopWatchInFlight) {
     recordDesktopWatchMetric("polls_skipped_in_flight");
@@ -6979,22 +7033,37 @@ async function pollDesktopWatch() {
     return;
   }
   const startedAt = Date.now();
+  const checkBudget = () => {
+    if (Date.now() - startedAt >= (options.sampleBudgetMs ?? DESKTOP_WATCH_SAMPLE_BUDGET_MS)) {
+      const error = new Error("Codex desktop snapshot sampling budget exceeded");
+      error.code = "desktop_snapshot_expired";
+      throw error;
+    }
+  };
   recordDesktopWatchMetric("polls_started");
   let pollFailed = false;
-  desktopWatchInFlight = true;
+  let pollDiscarded = false;
+  let resample = false;
+  const completion = Promise.withResolvers();
+  desktopWatchInFlight = completion.promise;
   try {
-    const controller = await codexDesktopController();
+    const controller = options.controller || await codexDesktopController();
+    checkBudget();
     const foregroundRuntime = await controller.currentThreadRuntimeState().catch(() => null);
+    checkBudget();
     const rawInteractiveSurface = await controller.readInteractiveSurface().catch(() => null);
+    checkBudget();
+    await assertDesktopForegroundUnchanged(controller, foregroundRuntime);
     const snapshot = await currentDesktopConversationSnapshot({
       controller,
       runtime: foregroundRuntime,
+      checkpoint: checkBudget,
       // A watcher only reads the closed state. Opening a menu belongs to an
       // explicit describe/apply request and must never mutate the desktop UI.
       allowMenuSampling: false,
     });
+    checkBudget();
     const runtime = snapshot && snapshot.runtime && typeof snapshot.runtime === "object" ? snapshot.runtime : {};
-    const composer = snapshot && snapshot.composer && typeof snapshot.composer === "object" ? snapshot.composer : {};
     const threadID = firstNonEmpty(runtime.current_thread_id);
     if (!isThreadID(threadID)) {
       const fingerprint = anonymousDraftFingerprint(runtime);
@@ -7012,20 +7081,27 @@ async function pollDesktopWatch() {
       reportDesktopWatchFailure();
       return;
     }
-	if (mobileDrafts.size > 0) {
-		emitMobileDraftsStale("desktop foreground changed to a conversation");
-	}
     const messagesSignature = await threadMessagesSignature(threadID).catch(() => "");
+    checkBudget();
+    const interactiveControls = await readCodexInteractiveControls(controller);
+    checkBudget();
+    const status = desktopWatchStatus(runtime);
+    const sessionHint = await desktopWatchSessionHint(threadID, snapshot, status);
+    checkBudget();
+    const trackedRollout = status === "running" || status === "waiting_approval"
+      ? await resolveRolloutFile(threadID) : null;
+    await assertDesktopForegroundUnchanged(controller, foregroundRuntime);
+    checkBudget();
+    if (mobileDrafts.size > 0) {
+      emitMobileDraftsStale("desktop foreground changed to a conversation");
+    }
     const transition = observeDesktopWatchForeground(desktopWatchState, threadID);
     const interactiveSurface = interactiveSurfaceForForeground(desktopWatchState, transition, threadID, rawInteractiveSurface);
-    const liveRun = controlsRuntimeFromDesktopSnapshot(threadID, runtime) || { status: "idle" };
-    const controlsLocked = String(liveRun.status || "").trim().toLowerCase() === "waiting_approval";
     // The watcher reads only the already-rendered composer. This keeps the
     // projection current without opening any Codex menu in the background.
     rememberLiveControlOptions(threadID, {
-      interactiveControls: await readCodexInteractiveControls(controller),
+      interactiveControls,
     });
-    const status = desktopWatchStatus(runtime);
     const detailSignature = desktopWatchSignature(snapshot, messagesSignature, interactiveSurface);
     const indexSignature = desktopIndexWatchSignature(snapshot, status);
     const detailSnapshot = detailSnapshotFromDesktopWatch(threadID, snapshot, messagesSignature, interactiveSurface);
@@ -7033,7 +7109,6 @@ async function pollDesktopWatch() {
       reportDesktopWatchFailure();
       return;
     }
-    const sessionHint = await desktopWatchSessionHint(threadID, snapshot, status);
     if (transition.switched) {
       for (const subscriber of desktopWatchSubscribers.values()) {
         if (subscriber.pluginWide || subscriber.threadID === transition.previousThreadID) {
@@ -7041,9 +7116,7 @@ async function pollDesktopWatch() {
         }
       }
     }
-    await emitDesktopTerminalRunEvents(threadID, status, detailSnapshot, sessionHint, { requireFresh: true });
     if (status === "running" || status === "waiting_approval") {
-      const trackedRollout = await resolveRolloutFile(threadID);
       desktopRunFileWatchStart(threadID, trackedRollout);
     }
     for (const subscriber of desktopWatchSubscribers.values()) {
@@ -7069,18 +7142,37 @@ async function pollDesktopWatch() {
         });
       }
     }
+    // 已核验的界面帧在同一轮同步发布。终态还需读取证据，发布和记录去重前另行核验。
+    await emitDesktopTerminalRunEvents(threadID, status, detailSnapshot, sessionHint, {
+      requireFresh: true,
+      beforePublish: async () => {
+        await assertDesktopForegroundUnchanged(controller, foregroundRuntime);
+        checkBudget();
+      },
+    });
   } catch (error) {
+    if (error && (error.code === "desktop_foreground_changed" || error.code === "desktop_snapshot_expired")) {
+      pollDiscarded = true;
+      resample = error.code === "desktop_foreground_changed";
+      recordDesktopWatchMetric("polls_discarded");
+      return;
+    }
     pollFailed = true;
     recordDesktopWatchMetric("polls_failed");
     console.error(`[codex] desktop watcher poll failed: ${error && error.message ? error.message : String(error)}`);
     reportDesktopWatchFailure();
   } finally {
     const costMs = Date.now() - startedAt;
-    if (!pollFailed) recordDesktopWatchMetric("polls_completed");
+    if (!pollFailed && !pollDiscarded) recordDesktopWatchMetric("polls_completed");
     recordDesktopWatchMetric("poll_cost_ms_total", costMs);
     desktopWatchTelemetry.poll_cost_ms_max = Math.max(desktopWatchTelemetry.poll_cost_ms_max, costMs);
     logDesktopWatchTelemetry();
-    desktopWatchInFlight = false;
+    desktopWatchInFlight = null;
+    completion.resolve();
+    if (resample && desktopWatchSubscribers.size > 0) {
+      const timer = setTimeout(() => { pollDesktopWatch().catch(() => {}); }, 50);
+      timer.unref?.();
+    }
   }
 }
 
@@ -7262,7 +7354,7 @@ async function interrupt(session) {
   return runExclusiveDesktopControl(async () => {
     const controller = await codexDesktopController();
     await selectRequiredCodexThread(controller, threadID);
-    await controller.interrupt();
+    await controller.interrupt(threadID);
   });
 }
 
@@ -7432,6 +7524,13 @@ if (require.main === module) {
 
 module.exports = {
   __test: {
+    waitForDesktopWatch,
+    desktopForegroundIdentity,
+    assertDesktopForegroundUnchanged,
+    currentDesktopConversationSnapshot,
+    conversationDetailSnapshotFromDesktop,
+    pollDesktopWatch,
+    desktopWatchSubscribers,
     createDesktopWatchState,
     createDesktopDirectoryState,
     desktopDirectoryEntrySignature,
