@@ -199,15 +199,24 @@ test("Codex CDP target selection ignores auxiliary pages", () => {
   assert.equal(selectCodexMainPageTarget(targets.slice(0, 3)), null);
 });
 
-test("CDP capability probe is a bounded main-page reachability check", () => {
-  const source = require("node:fs").readFileSync(require.resolve("../codex_cdp.js"), "utf8");
-  assert.equal(typeof probeCodexMainPage, "function");
-  const probe = source.slice(source.indexOf("async function probeCodexMainPage"), source.indexOf("function singletonArtifacts"));
-  assert.match(probe, /AbortSignal\.timeout\(2000\)/);
-  assert.match(probe, /selectCodexMainPageTarget/);
-  assert.match(probe, /for \(let attempt = 0; attempt < attempts; attempt \+= 1\)/);
-  assert.doesNotMatch(probe, /launchManagedTarget/);
-  assert.doesNotMatch(probe, /waitForReady/);
+test("CDP 能力探测遵守整体超时且不会等待无响应端口", async () => {
+  const originalFetch = global.fetch;
+  let calls = 0;
+  let signal;
+  global.fetch = (_, options) => {
+    calls += 1;
+    signal = options.signal;
+    return new Promise(() => {});
+  };
+  try {
+    const started = Date.now();
+    assert.equal(await probeCodexMainPage({ cdpUrl: "http://127.0.0.1:19999", timeoutMs: 50 }), false);
+    assert.ok(Date.now() - started < 600);
+    assert.equal(calls, 1);
+    assert.equal(signal.aborted, true);
+  } finally {
+    global.fetch = originalFetch;
+  }
 });
 
 test("Windows process discovery includes the Microsoft Store Codex host", () => {
