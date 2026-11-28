@@ -65,3 +65,20 @@ test("fresh draft waiting accepts Codex reusing an already-empty anonymous draft
     composer_available: true,
   }, 450);
 });
+
+for (const [name, patch] of [
+  ["attachments without text", { composer_has_attachments: true }],
+  ["unreadable editor text", { composer_text: null }],
+  ["missing editor text", { composer_text: undefined }],
+  ["unavailable editor", { composer_available: false }],
+  ["unverified editor availability", { composer_available: undefined }],
+  ["running draft", { running: true }],
+  ["approval draft", { waiting_approval: true }],
+]) {
+  test(`anonymous draft with ${name} is preserved`, () => {
+    assert.equal(__test.isReplaceableAnonymousDraft({
+      current_thread_id: "", client_thread_id: "client-draft-1",
+      composer_text: "", composer_available: true, ...patch,
+    }), false);
+  });
+}
